@@ -1,0 +1,18 @@
+# 실행 중 생기는 진단 로그
+debug_*.txt
+
+# 사용자가 등록한 명령 (개인 설정) - 예시는 commands.example.json 참고
+commands.json
+
+# 테스트 산출물
+clap_test_result_*.png
+
+# Python
+__pycache__/
+*.pyc
+
+# 편집기
+.vscode/
+
+# 발표 자료 빌드 환경
+node_modules/

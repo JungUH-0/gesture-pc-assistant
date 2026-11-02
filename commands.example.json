@@ -1,0 +1,18 @@
+{
+  "pinch_middle": {
+    "action": "open_app",
+    "target": "chrome"
+  },
+  "pinch_ring": {
+    "action": "open_app",
+    "target": "notepad"
+  },
+  "away": {
+    "action": "turn_off_monitor",
+    "target": null
+  },
+  "back": {
+    "action": "turn_on_monitor",
+    "target": null
+  }
+}

@@ -1,0 +1,582 @@
+# ============================================================
+#  개인 AI 비서 - 전신 포즈 입력 모듈
+#  MediaPipe Pose(BlazePose, 33개 랜드마크)로 상체 자세를 인식한다.
+#
+#  [카메라 소유권] 카메라는 하나뿐이라 두 모듈이 동시에 VideoCapture를 열 수 없다.
+#  그래서 이 모듈은 카메라를 직접 열지 않고, cameramodule이 읽어온 프레임을
+#  process()로 넘겨받아 처리한다. (cameramodule이 포즈 모드일 때만 호출함)
+#
+#  [현재 범위] 랜드마크 검출 + 특징 벡터 추출까지만 구현. 자세 분류(학습된 모델)는
+#  아직 없음 - 손 제스처 때와 마찬가지로 "먼저 인식되는지 확인 → 그다음 학습" 순서.
+#
+#  [모드 전환] 포즈 모드에서도 손 모드로 돌아가야 하는데, 이때는 mediapipe 손 추적이
+#  꺼져 있으므로 포즈의 손목 좌표(15, 16)로 양손 모임을 판정한다. 어깨 너비로 나눠서
+#  카메라와의 거리에 무관하게 동작하게 함.
+#
+#  [좌우 주의] cameramodule이 프레임을 거울 모드로 뒤집어서(cv.flip) 넘겨주기 때문에,
+#  여기서 말하는 mediapipe의 "왼쪽"(LEFT_*)은 화면 기준이며 실제로는 사용자의
+#  오른쪽이다. 분류 자체에는 문제가 없지만(항상 일관되게 뒤집혀 있으므로), 나중에
+#  자세에 "오른팔 들기" 같은 이름을 붙일 때 좌우가 반대라는 점을 기억해야 한다.
+# ============================================================
+
+import time
+import threading
+import numpy as np
+import cv2 as cv
+import mediapipe as mp
+# 한글 텍스트 표시 헬퍼는 cameramodule에 있는 것을 그대로 재사용 (cv.putText는 한글 불가).
+# cameramodule은 posemodule을 import하지 않으므로 순환 import가 생기지 않는다.
+from cameramodule import put_korean_text
+
+mp_pose    = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+
+# ── 사용할 랜드마크 (BlazePose 33개 중 팔 + 머리) ───────────
+# [수정] 명령을 "팔 동작 + 머리 동작"으로 주기로 해서 구성을 바꿈.
+#  - 엉덩이(23, 24) 제거: 책상 앞에 앉으면 가려지거나 화면 밖이라 계속 pose skip이 났음
+#  - 귀(7, 8) 추가: 머리 방향(돌리기/기울이기)을 판정하려면 필요하고,
+#                   웹캠 앞에서는 거의 항상 보이는 부위라 안정적임
+# [확장] 나중에 전신까지 쓰려면 다리를 추가하면 됨:
+#   23, 24 엉덩이 / 25, 26 무릎 / 27, 28 발목 / 29, 30 뒤꿈치 / 31, 32 발끝
+# 특징 벡터 차원과 이후 수집/학습 스크립트는 이 목록을 따라가므로 여기만 고치면 된다.
+UPPER_BODY_KEYPOINTS = [
+    0,       # 코
+    7, 8,    # 귀 (머리 방향)
+    11, 12,  # 어깨 (정규화 기준)
+    13, 14,  # 팔꿈치
+    15, 16,  # 손목
+]
+
+# [추가] 이 관절들이 안 보이면 팔 자세 자체를 판단할 수 없으므로 프레임을 버린다.
+# 반대로 머리 쪽(코·귀)은 안 보여도 팔 동작은 판정할 수 있으므로 필수에서 뺐다.
+REQUIRED_KEYPOINTS = [11, 12, 13, 14, 15, 16]  # 어깨·팔꿈치·손목
+
+# 정규화 기준으로 쓰는 랜드마크 (양 어깨)
+LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
+# 양손 모임(모드 전환) 판정에 쓰는 랜드마크 (양 손목)
+LEFT_WRIST, RIGHT_WRIST = 15, 16
+# 팔꿈치 각도 계산용 (어깨 - 팔꿈치 - 손목)
+LEFT_ELBOW, RIGHT_ELBOW = 13, 14
+# 머리 방향 계산용
+NOSE, LEFT_EAR, RIGHT_EAR = 0, 7, 8
+
+# ── 판정 설정 ─────────────────────────────────────────────
+# 선택한 랜드마크가 이 값보다 잘 안 보이면(가려짐/화면 밖) 그 프레임은 버림.
+# mediapipe가 안 보이는 관절도 좌표를 "추측해서" 내놓기 때문에, 이걸 안 걸러내면
+# 쓰레기 값이 특징 벡터에 그대로 섞여 들어간다.
+MIN_VISIBILITY = 0.5
+
+# 양 손목 사이 거리가 어깨 너비의 이 비율보다 가까우면 "양손 모임"으로 판정.
+# 고정 좌표값 대신 어깨 너비로 나눈 비율을 쓰는 이유는, 사람이 카메라에서 멀어지면
+# 화면상 거리가 전부 작아져서 고정값 기준은 무조건 "가깝다"고 나오기 때문.
+HANDS_TOGETHER_SHOULDER_RATIO = 0.5
+
+MIN_SHOULDER_WIDTH = 1e-6  # 0으로 나누기 방지
+
+# ── 고개 끄덕임(예) / 가로젓기(아니오) 판정 ─────────────────
+# 최근 HEAD_WINDOW_SEC 동안의 머리 값을 모아, 한 방향으로 움직였다가 되돌아오는 횟수
+# (swing)가 HEAD_MIN_SWINGS 이상이면 인정한다. 한 번 숙이거나 돌린 것만으로는 인정하지 않음.
+#  - 끄덕임: 코-귀 중점의 세로 거리(어깨 너비로 나눈 값)가 위아래로 흔들림
+#  - 가로젓기: 기존 head_turn 값이 좌우로 흔들림
+# [미실측] 아래 임계값은 추정치다. debug_pose.txt의 headPitch / headTurn 값을 보고 조정할 것.
+#
+# 각 값의 의미와 조정 방향 (swing 1회 = 한 방향으로 움직임, 되돌아오면 +1)
+#  - HEAD_WINDOW_SEC: 이 시간 안의 움직임만 본다. 늘리면 느린 끄덕임도 잡히지만,
+#    평소 고개 움직임이 섞여 오작동이 늘어난다.
+#  - HEAD_MIN_SWINGS: 방향이 바뀐 횟수. 숙임 1회, 듦 2회로 세므로 2 = 끄덕임 한 번,
+#    4 = 끄덕임 두 번(현재). 작을수록 쉽게 인정되고 오작동도 늘어난다. 두 번 끄덕이는데도
+#    안 잡히면 3으로 내리거나 HEAD_WINDOW_SEC를 늘린다.
+#  - HEAD_PITCH_MIN_SWING: 끄덕임 진폭. 작은 떨림을 무시하는 기준이라, 끄덕여도 반응이 없으면
+#    낮추고, 가만히 있어도 반응하면 높인다. debug_pose.txt의 headPitch가 끄덕일 때 얼마나
+#    변하는지 보고 그 절반쯤으로 잡는다.
+#  - HEAD_TURN_MIN_SWING: 가로젓기 진폭. 위와 같은 방식으로 headTurn 변화량을 보고 조정.
+#  - HEAD_OTHER_MAX_SWINGS: 끄덕임 중에는 좌우 swing이, 가로젓기 중에는 위아래 swing이 이 값
+#    이하여야 한다. 작을수록 대각선 움직임을 확실히 거부하지만, 자연스럽게 비스듬히 움직이는
+#    사람은 인정이 안 되어 일부러 곧게 움직이게 된다. 인정이 안 되면 2로 올린다.
+#  - HEAD_DOMINANCE_RATIO: 해당 축 진폭(기준 대비 비율)이 상대 축의 몇 배 이상이어야 하는지.
+#    1.5가 시작값이고, 크게 올리면 움직임을 과장해야 하니 느슨하게 유지한다.
+#  - HEAD_EVENT_COOLDOWN: 인정 직후 이 시간 동안은 다시 인정하지 않음. 한 번 끄덕였는데
+#    예가 두 번 나가는 것을 막는다.
+#  - HEAD_EVENT_HOLD_SEC: 결과를 True로 유지하는 시간. main의 폴링(0.02초)이 놓치지 않게
+#    하는 값이라 보통 바꿀 필요가 없다.
+HEAD_WINDOW_SEC       = 2.0
+HEAD_MIN_SWINGS       = 4      # 숙임-듦-숙임-듦 (또는 좌-우-좌-우) 두 번 반복
+HEAD_OTHER_MAX_SWINGS = 1      # 상대 축에서 허용하는 최대 swing (대각선 움직임 거부)
+HEAD_DOMINANCE_RATIO  = 1.5    # 해당 축 진폭 비율이 상대 축의 이 배수 이상이어야 인정
+HEAD_PITCH_MIN_SWING  = 0.06   # 끄덕임으로 볼 최소 진폭 (어깨 너비 대비)
+HEAD_TURN_MIN_SWING   = 0.25   # 가로젓기로 볼 최소 진폭 (head_turn 단위)
+HEAD_EVENT_COOLDOWN   = 1.0    # 한 번 인정한 뒤 다시 인정하기까지의 최소 간격
+HEAD_EVENT_HOLD_SEC   = 0.3    # 결과값을 True로 유지하는 시간 (main의 0.02초 폴링이 놓치지 않게)
+
+# ── 자리 비움 판정 ─────────────────────────────────────────
+# 사람(포즈 랜드마크)이 이 시간 이상 화면에서 보이지 않으면 "자리 비움"으로 판정.
+# 팔이 가려진 경우(특징 추출 실패)와 구분하기 위해 랜드마크 자체가 없을 때만 센다.
+AWAY_AFTER_SEC = 5.0
+# process()가 이 시간 이상 호출되지 않았다면 포즈 모드에 막 들어온 것으로 보고 타이머를 새로 시작
+PROCESS_GAP_RESET_SEC = 1.0
+
+# [추가] 진단용 - 팔꿈치 각도/머리 방향/손목 위치가 실제 동작에서 어떻게 움직이는지
+# 파일로 남겨서 나중에 확인한다. (어떤 자세가 값으로 잘 구분되는지 판단하는 근거)
+# 매 프레임 남기면 파일이 너무 커지므로 일정 간격으로만 기록한다.
+DEBUG_LOG_ENABLED  = True
+DEBUG_LOG_PATH     = "debug_pose.txt"
+DEBUG_LOG_INTERVAL = 0.3  # 초
+
+# 특징 벡터에서 특정 랜드마크의 (x, y) 위치를 찾기 위한 표.
+# UPPER_BODY_KEYPOINTS 순서대로 좌표가 2개씩 들어가므로, 목록을 바꿔도 자동으로 맞춰진다.
+_KP_FEATURE_INDEX = {kp: i * 2 for i, kp in enumerate(UPPER_BODY_KEYPOINTS)}
+
+
+def _keypoint_feature(features, kp):
+    """특징 벡터에서 해당 랜드마크의 정규화된 (x, y)를 꺼냄"""
+    i = _KP_FEATURE_INDEX[kp]
+    return features[i], features[i + 1]
+
+
+def get_bounding_box(landmarks, frame_w, frame_h, padding=0.06):
+    """
+    [추가] 랜드마크들을 감싸는 사각형(박스)을 계산.
+    MediaPipe Pose는 YOLO와 달리 박스를 직접 주지 않기 때문에(랜드마크만 출력),
+    우리가 쓰는 관절들의 좌표 min/max로 직접 만든다.
+    padding은 박스가 몸에 너무 딱 붙지 않게 하는 여백 (프레임 크기 대비 비율).
+    반환값: (x1, y1, x2, y2) 픽셀 좌표 또는 None
+    """
+    xs, ys = [], []
+    for idx in UPPER_BODY_KEYPOINTS:
+        lm = landmarks[idx]
+        if lm.visibility < MIN_VISIBILITY:
+            continue
+        xs.append(lm.x)
+        ys.append(lm.y)
+
+    if not xs:
+        return None
+
+    pad_x, pad_y = padding, padding
+    x1 = int(max(0.0, min(xs) - pad_x) * frame_w)
+    x2 = int(min(1.0, max(xs) + pad_x) * frame_w)
+    y1 = int(max(0.0, min(ys) - pad_y) * frame_h)
+    y2 = int(min(1.0, max(ys) + pad_y) * frame_h)
+    return x1, y1, x2, y2
+
+
+def _joint_angle(a, b, c):
+    """
+    b를 꼭짓점으로 하는 a-b-c 사잇각을 0~1로 정규화해서 반환 (0=접힘, 1=펴짐).
+    손 모듈(extract_vector_angle_features)에서 관절 각도를 쓰던 방식과 같다.
+    각도는 좌표와 달리 위치·크기에 전혀 영향을 받지 않아서, "팔을 굽혔나 폈나"
+    같은 구분에 특히 강하다.
+    """
+    v1x, v1y = a.x - b.x, a.y - b.y
+    v2x, v2y = c.x - b.x, c.y - b.y
+    n1 = (v1x ** 2 + v1y ** 2) ** 0.5
+    n2 = (v2x ** 2 + v2y ** 2) ** 0.5
+    if n1 < MIN_SHOULDER_WIDTH or n2 < MIN_SHOULDER_WIDTH:
+        return 0.0
+    cos = (v1x * v2x + v1y * v2y) / (n1 * n2)
+    return float(np.arccos(np.clip(cos, -1.0, 1.0)) / np.pi)
+
+
+def _head_features(landmarks, shoulder_width):
+    """
+    머리 방향 특징 2개. 귀가 안 보이면 (0, 0)을 반환해서 "중립"으로 둔다.
+      - 돌리기(yaw): 코가 어느 쪽 귀에 더 가까운지. 정면이면 0, 좌우로 돌리면 ±
+      - 기울이기(roll): 양 귀를 잇는 선이 수평에서 얼마나 기울었는지
+    둘 다 비율/각도라서 카메라와의 거리에 영향을 받지 않는다.
+    """
+    nose = landmarks[NOSE]
+    le, re = landmarks[LEFT_EAR], landmarks[RIGHT_EAR]
+
+    if (le.visibility < MIN_VISIBILITY or re.visibility < MIN_VISIBILITY
+            or nose.visibility < MIN_VISIBILITY):
+        return 0.0, 0.0
+
+    ear_dist = ((le.x - re.x) ** 2 + (le.y - re.y) ** 2) ** 0.5
+    if ear_dist < MIN_SHOULDER_WIDTH:
+        return 0.0, 0.0
+
+    d_left  = ((nose.x - le.x) ** 2 + (nose.y - le.y) ** 2) ** 0.5
+    d_right = ((nose.x - re.x) ** 2 + (nose.y - re.y) ** 2) ** 0.5
+    head_turn = (d_right - d_left) / ear_dist
+
+    head_tilt = float(np.arctan2(le.y - re.y, le.x - re.x) / np.pi)
+    return float(head_turn), head_tilt
+
+
+def _head_pitch(landmarks, shoulder_width):
+    """
+    고개 숙임 정도의 대용 값. 코와 두 귀 중점의 세로 차이를 어깨 너비로 나눈 값으로,
+    고개를 숙이면 코가 귀보다 내려가 값이 커진다. 머리가 안 보이면 None.
+    """
+    nose = landmarks[NOSE]
+    le, re = landmarks[LEFT_EAR], landmarks[RIGHT_EAR]
+    if (le.visibility < MIN_VISIBILITY or re.visibility < MIN_VISIBILITY
+            or nose.visibility < MIN_VISIBILITY):
+        return None
+    return float((nose.y - (le.y + re.y) / 2.0) / shoulder_width)
+
+
+def _count_swings(values, min_swing):
+    """
+    값이 위아래(또는 좌우)로 min_swing 이상 방향을 바꾼 횟수.
+    작은 떨림은 무시하고, 기준 이상 움직였다가 되돌아올 때마다 1회로 센다.
+    """
+    swings = 0
+    ref = values[0]
+    direction = 0  # 0=아직 모름, 1=증가 중, -1=감소 중
+    for v in values[1:]:
+        if direction == 0:
+            if abs(v - ref) >= min_swing:
+                direction = 1 if v > ref else -1
+                ref = v
+                swings += 1
+        elif direction == 1:
+            if v > ref:
+                ref = v
+            elif ref - v >= min_swing:
+                direction = -1
+                ref = v
+                swings += 1
+        else:
+            if v < ref:
+                ref = v
+            elif v - ref >= min_swing:
+                direction = 1
+                ref = v
+                swings += 1
+    return swings
+
+
+class HeadMotionDetector:
+    """머리 값(pitch, turn)의 최근 기록으로 끄덕임 / 가로젓기를 판정"""
+
+    def __init__(self):
+        self._history = []  # (time, pitch, turn)
+        self._last_fire = 0.0
+
+    def clear(self):
+        self._history.clear()
+
+    def update(self, now, pitch, turn):
+        """매 프레임 호출. 'nod' / 'shake' / None 반환"""
+        if pitch is None:
+            self._history.clear()  # 머리가 안 보이면 이어 붙이지 않음
+            return None
+
+        self._history.append((now, pitch, turn))
+        while self._history and now - self._history[0][0] > HEAD_WINDOW_SEC:
+            self._history.pop(0)
+
+        if now - self._last_fire < HEAD_EVENT_COOLDOWN or len(self._history) < 2 * HEAD_MIN_SWINGS:
+            return None
+
+        pitch_swings = _count_swings([h[1] for h in self._history], HEAD_PITCH_MIN_SWING)
+        turn_swings  = _count_swings([h[2] for h in self._history], HEAD_TURN_MIN_SWING)
+
+        # 두 축의 진폭을 각자의 최소 진폭으로 나눈 비율. 단위가 달라 그냥 비교할 수 없어서
+        # "기준의 몇 배나 움직였나"로 맞춘 값이다.
+        pitches = [h[1] for h in self._history]
+        turns   = [h[2] for h in self._history]
+        pitch_ratio = (max(pitches) - min(pitches)) / HEAD_PITCH_MIN_SWING
+        turn_ratio  = (max(turns) - min(turns)) / HEAD_TURN_MIN_SWING
+
+        # 인정 조건 (대각선으로 흔들거나 가로젓다가 위아래가 섞인 경우를 제외)
+        #  1) 해당 축의 swing이 HEAD_MIN_SWINGS 이상
+        #  2) 상대 축의 swing이 HEAD_OTHER_MAX_SWINGS 이하
+        #  3) 해당 축의 진폭 비율이 상대 축의 HEAD_DOMINANCE_RATIO배 이상
+        if (pitch_swings >= HEAD_MIN_SWINGS and turn_swings <= HEAD_OTHER_MAX_SWINGS
+                and pitch_ratio >= HEAD_DOMINANCE_RATIO * turn_ratio):
+            event = "nod"
+        elif (turn_swings >= HEAD_MIN_SWINGS and pitch_swings <= HEAD_OTHER_MAX_SWINGS
+                and turn_ratio >= HEAD_DOMINANCE_RATIO * pitch_ratio):
+            event = "shake"
+        else:
+            return None
+
+        self._last_fire = now
+        self._history.clear()
+        return event
+
+
+def extract_pose_features(landmarks):
+    """
+    선택한 랜드마크들을 '몸 기준'으로 정규화한 특징 벡터로 변환.
+    - 양 어깨의 중점을 원점으로 옮기고 (사람이 화면 어디에 서 있든 같은 값)
+    - 어깨 너비로 나눠 스케일을 맞춤 (카메라에서 멀든 가깝든 같은 값)
+    - [추가] 좌표만으로는 부족해서 팔꿈치 각도 2개 + 머리 방향 2개를 덧붙임
+
+    구성: 좌표 9개×2 = 18 + 팔꿈치 각도 2 + 머리 방향 2 = 22차원
+    반환값: (특징 numpy 배열, None) 또는 (None, 실패 사유)
+    """
+    ls = landmarks[LEFT_SHOULDER]
+    rs = landmarks[RIGHT_SHOULDER]
+
+    # [수정] 필수 관절(팔)만 확인. 머리 쪽은 안 보여도 팔 동작은 판정할 수 있으므로
+    # 프레임을 버리지 않고, 대신 머리 특징만 중립값(0)으로 처리한다.
+    for idx in REQUIRED_KEYPOINTS:
+        if landmarks[idx].visibility < MIN_VISIBILITY:
+            return None, f"랜드마크 {idx}가 잘 안 보임"
+
+    origin_x = (ls.x + rs.x) / 2.0
+    origin_y = (ls.y + rs.y) / 2.0
+    shoulder_width = ((ls.x - rs.x) ** 2 + (ls.y - rs.y) ** 2) ** 0.5
+    if shoulder_width < MIN_SHOULDER_WIDTH:
+        return None, "어깨 너비를 잴 수 없음"
+
+    features = []
+    for idx in UPPER_BODY_KEYPOINTS:
+        lm = landmarks[idx]
+        features.append((lm.x - origin_x) / shoulder_width)
+        features.append((lm.y - origin_y) / shoulder_width)
+
+    # 팔꿈치 각도 (어깨 - 팔꿈치 - 손목)
+    features.append(_joint_angle(landmarks[LEFT_SHOULDER],
+                                 landmarks[LEFT_ELBOW],
+                                 landmarks[LEFT_WRIST]))
+    features.append(_joint_angle(landmarks[RIGHT_SHOULDER],
+                                 landmarks[RIGHT_ELBOW],
+                                 landmarks[RIGHT_WRIST]))
+
+    # 머리 방향 (돌리기 / 기울이기)
+    head_turn, head_tilt = _head_features(landmarks, shoulder_width)
+    features.append(head_turn)
+    features.append(head_tilt)
+
+    return np.array(features, dtype=np.float32), None
+
+
+def get_hands_together(landmarks):
+    """
+    양 손목이 모였는지 판정 (포즈 모드에서 모드 전환 신호로 사용).
+    어깨 너비 대비 비율로 보기 때문에 카메라와의 거리와 무관하다.
+    """
+    lw, rw = landmarks[LEFT_WRIST], landmarks[RIGHT_WRIST]
+    ls, rs = landmarks[LEFT_SHOULDER], landmarks[RIGHT_SHOULDER]
+
+    if lw.visibility < MIN_VISIBILITY or rw.visibility < MIN_VISIBILITY:
+        return False
+
+    shoulder_width = ((ls.x - rs.x) ** 2 + (ls.y - rs.y) ** 2) ** 0.5
+    if shoulder_width < MIN_SHOULDER_WIDTH:
+        return False
+
+    wrist_dist = ((lw.x - rw.x) ** 2 + (lw.y - rw.y) ** 2) ** 0.5
+    return (wrist_dist / shoulder_width) < HANDS_TOGETHER_SHOULDER_RATIO
+
+
+class PoseModule:
+    """
+    전신(상체) 포즈를 인식하는 모듈.
+    카메라를 직접 열지 않고, cameramodule이 넘겨주는 프레임을 process()로 처리한다.
+    결과는 self.result에 저장되고 외부에서 get_result()로 읽는다.
+    """
+
+    def __init__(self):
+        self.pose = mp_pose.Pose(
+            model_complexity=1,
+            smooth_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+        self.result = {
+            "pose_detected"  : False,  # 이번 프레임에 사람 포즈가 잡혔는지
+            "pose_features"  : None,   # 정규화된 상체 특징 벡터 (수집/학습/분류용)
+            "hands_together" : False,  # 양손 모임 - 포즈 모드에서 모드 전환 판정에 사용
+            "pose_name"      : None,   # [예정] 학습된 분류기가 붙으면 자세 이름이 들어갈 자리
+            "nod"            : False,  # 고개 끄덕임 (예) - HEAD_EVENT_HOLD_SEC 동안 True 유지
+            "shake"          : False,  # 고개 가로젓기 (아니오)
+            "away"           : False,  # 자리 비움 - 사람이 AWAY_AFTER_SEC 이상 안 보이는 동안 True
+        }
+        self._lock = threading.Lock()
+
+        self._head = HeadMotionDetector()
+        self._nod_until   = 0.0
+        self._shake_until = 0.0
+        self._last_seen_time    = time.time()  # 사람이 마지막으로 보인 시각
+        self._last_process_time = 0.0
+
+        # [추가] 진단 로그 상태
+        self._last_log_time = 0.0
+        if DEBUG_LOG_ENABLED:
+            try:
+                with open(DEBUG_LOG_PATH, "w", encoding="utf-8") as f:
+                    f.write(f"[포즈 진단 로그 시작 @ {time.strftime('%H:%M:%S')}]\n")
+                    f.write(f"키포인트: {UPPER_BODY_KEYPOINTS} / 특징 {len(UPPER_BODY_KEYPOINTS)*2 + 4}차원\n")
+                    f.write("elbow: 0=완전히 굽힘 1=완전히 폄 / head turn·tilt: 정면 0, 좌우 ±\n")
+                    f.write("wrist: 어깨중점 기준 정규화 좌표 (y는 아래가 +, 팔 들면 -)\n")
+            except OSError:
+                pass
+
+    # ── 내부: 진단 로그 기록 ──────────────────────────────
+    def _debug_log(self, features, reason, pitch=None):
+        if not DEBUG_LOG_ENABLED:
+            return
+        now = time.time()
+        if now - self._last_log_time < DEBUG_LOG_INTERVAL:
+            return
+        self._last_log_time = now
+
+        if features is None:
+            line = (f"{time.strftime('%H:%M:%S')} pose skip: {reason} "
+                    f"(머리 판정은 계속, headPitch={'-' if pitch is None else format(pitch, '+.2f')})")
+        else:
+            lwx, lwy = _keypoint_feature(features, LEFT_WRIST)
+            rwx, rwy = _keypoint_feature(features, RIGHT_WRIST)
+            line = (f"{time.strftime('%H:%M:%S')} "
+                    f"elbowL={features[-4]:.2f} elbowR={features[-3]:.2f} "
+                    f"headTurn={features[-2]:+.2f} headTilt={features[-1]:+.2f} "
+                    f"headPitch={'-' if pitch is None else format(pitch, '+.2f')} "
+                    f"wristL=({lwx:+.2f},{lwy:+.2f}) wristR=({rwx:+.2f},{rwy:+.2f})")
+
+        try:
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    def _debug_note(self, text):
+        """이벤트 발생 시점을 진단 로그에 한 줄 남김 (간격 제한 없이)"""
+        if not DEBUG_LOG_ENABLED:
+            return
+        try:
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+        except OSError:
+            pass
+
+    # ── 외부(cameramodule)에서 매 프레임 호출 ────────────────
+    def process(self, frame_rgb, frame_vis):
+        res = self.pose.process(frame_rgb)
+
+        detected       = False
+        features       = None
+        hands_together = False
+        head_event     = None
+        head_pitch     = None
+
+        now = time.time()
+        # 포즈 모드에 막 들어온 경우(한동안 process가 호출되지 않았음) 자리 비움 타이머를 새로 시작
+        if now - self._last_process_time > PROCESS_GAP_RESET_SEC:
+            self._last_seen_time = now
+            self._head.clear()
+        self._last_process_time = now
+
+        if res.pose_landmarks:
+            landmarks = res.pose_landmarks.landmark
+            self._last_seen_time = now
+
+            # 시각화 - 손 모드의 손 랜드마크 표시와 같은 방식
+            mp_drawing.draw_landmarks(
+                frame_vis, res.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                mp_drawing.DrawingSpec(color=(0, 200, 255), thickness=2, circle_radius=3),
+                mp_drawing.DrawingSpec(color=(255, 140, 0), thickness=2),
+            )
+
+            hands_together = get_hands_together(landmarks)
+            features, reason = extract_pose_features(landmarks)
+            detected = features is not None
+
+            # 끄덕임 / 가로젓기: 팔(팔꿈치·손목)이 가려져 특징 추출이 실패한 프레임에서도
+            # 판정한다. 필요한 것은 어깨(크기 기준)와 코·귀뿐이다.
+            ls_, rs_ = landmarks[LEFT_SHOULDER], landmarks[RIGHT_SHOULDER]
+            sw = ((ls_.x - rs_.x) ** 2 + (ls_.y - rs_.y) ** 2) ** 0.5
+            shoulders_ok = (ls_.visibility >= MIN_VISIBILITY and
+                            rs_.visibility >= MIN_VISIBILITY and sw >= MIN_SHOULDER_WIDTH)
+            if shoulders_ok:
+                head_pitch = _head_pitch(landmarks, sw)
+                head_turn, _ = _head_features(landmarks, sw)
+                head_event = self._head.update(now, head_pitch, head_turn)
+            else:
+                self._head.clear()
+
+            # [추가] 사람 주위에 박스 + 그 위에 자세 이름 표시.
+            # MediaPipe는 YOLO처럼 박스를 직접 주지 않아서 랜드마크 min/max로 직접 계산함.
+            h_frame, w_frame = frame_vis.shape[:2]
+            box = get_bounding_box(landmarks, w_frame, h_frame)
+            if box is not None:
+                x1, y1, x2, y2 = box
+                box_color = (0, 255, 100) if detected else (0, 165, 255)
+                cv.rectangle(frame_vis, (x1, y1), (x2, y2), box_color, 2)
+
+                # 분류기가 붙기 전까지는 자세 이름 자리에 상태를 대신 표시
+                with self._lock:
+                    pose_name = self.result["pose_name"]
+                label = pose_name if pose_name else ("자세 학습 전" if detected else "인식 불가")
+                # 박스가 화면 위쪽에 붙어도 글자가 잘리지 않게 위치 보정
+                label_y = y1 - 10 if y1 > 30 else y2 + 28
+                put_korean_text(frame_vis, label, (x1, label_y - 20),
+                                font_size=24, color=box_color)
+
+            # 특징을 못 뽑은 이유를 화면에 표시 (어느 관절이 안 보이는지 바로 알 수 있게)
+            status = f"pose ok ({len(features)}d)" if detected else f"pose skip: {reason}"
+            cv.putText(frame_vis, status, (10, 60),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.6,
+                       (0, 255, 100) if detected else (0, 165, 255), 2)
+
+            # [추가] 각도 특징이 실제로 어떻게 반응하는지 화면에서 바로 확인할 수 있게 표시.
+            # (팔을 굽히면 elbow 값이 내려가고, 고개를 돌리면 turn 값이 ±로 움직임)
+            if detected:
+                cv.putText(frame_vis,
+                           f"elbow L{features[-4]:.2f} R{features[-3]:.2f}  "
+                           f"head turn{features[-2]:+.2f} tilt{features[-1]:+.2f}",
+                           (10, 120), cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+            # 머리 판정은 팔과 별개로 동작하므로, 팔 인식 여부를 따로 표시
+            cv.putText(frame_vis, "arms OK" if detected else "arms hidden (head only)",
+                       (10, 210), cv.FONT_HERSHEY_SIMPLEX, 0.55,
+                       (0, 255, 100) if detected else (0, 165, 255), 2)
+
+            if hands_together:
+                cv.putText(frame_vis, "HANDS TOGETHER", (10, 90),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+
+            # [추가] 값 변화를 파일로 남겨서 나중에 어떤 자세가 잘 구분되는지 분석
+            self._debug_log(features, reason, head_pitch)
+        else:
+            self._head.clear()
+
+        if head_event == "nod":
+            self._nod_until = now + HEAD_EVENT_HOLD_SEC
+            self._debug_note(f"EVENT nod")
+        elif head_event == "shake":
+            self._shake_until = now + HEAD_EVENT_HOLD_SEC
+            self._debug_note(f"EVENT shake")
+
+        away = (now - self._last_seen_time) >= AWAY_AFTER_SEC
+        if now < self._nod_until:
+            cv.putText(frame_vis, "NOD (yes)", (10, 150),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if now < self._shake_until:
+            cv.putText(frame_vis, "SHAKE (no)", (10, 150),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if away:
+            cv.putText(frame_vis, "AWAY", (10, 180),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+        with self._lock:
+            self.result["pose_detected"]  = detected
+            self.result["pose_features"]  = features
+            self.result["hands_together"] = hands_together
+            self.result["nod"]            = now < self._nod_until
+            self.result["shake"]          = now < self._shake_until
+            self.result["away"]           = away
+
+    def get_result(self):
+        """현재 감지 결과 반환 (스레드 안전)"""
+        with self._lock:
+            return dict(self.result)
+
+    def reset(self):
+        """[추가] 모드가 바뀔 때 호출 - 이전 모드의 결과가 남아있지 않게 비움"""
+        with self._lock:
+            self.result["pose_detected"]  = False
+            self.result["pose_features"]  = None
+            self.result["hands_together"] = False
+            self.result["pose_name"]      = None
+            self.result["nod"]            = False
+            self.result["shake"]          = False
+            self.result["away"]           = False
+        self._head.clear()
+        self._nod_until = self._shake_until = 0.0
+        self._last_seen_time = time.time()

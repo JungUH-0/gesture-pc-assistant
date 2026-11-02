@@ -1,0 +1,17 @@
+# 개인 AI 비서 - 필요 라이브러리 (버전 미고정 초안)
+# 실제로 돌아가는 환경에서 `pip freeze`로 확인한 뒤 버전을 고정할 것.
+# 참고: mediapipe는 mp.solutions(구 API)를 쓰므로, 버전에 따라 동작이 달라질 수 있다.
+
+opencv-python
+mediapipe
+numpy
+pillow
+faster-whisper
+sounddevice
+requests
+pywin32
+
+# 외부 요소 (pip로 설치되지 않음)
+#  - Ollama 설치 후 모델 받기: ollama pull qwen2.5:3b-instruct
+#  - Whisper medium은 첫 실행 때 자동으로 내려받음 (GPU 권장, CUDA 환경 필요)
+#  - Windows 전용 (pywin32)
