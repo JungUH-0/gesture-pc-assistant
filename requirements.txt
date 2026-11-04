@@ -1,15 +1,14 @@
-# 개인 AI 비서 - 필요 라이브러리 (버전 미고정 초안)
-# 실제로 돌아가는 환경에서 `pip freeze`로 확인한 뒤 버전을 고정할 것.
-# 참고: mediapipe는 mp.solutions(구 API)를 쓰므로, 버전에 따라 동작이 달라질 수 있다.
+# 개인 AI 비서 - 필요 라이브러리 (Python 3.10.20 환경에서 확인한 버전)
+# 참고: mediapipe는 mp.solutions(구 API)를 쓰므로, 버전을 바꾸면 동작이 달라질 수 있다.
 
-opencv-python
-mediapipe
-numpy
-pillow
-faster-whisper
-sounddevice
-requests
-pywin32
+opencv-python==5.0.0.93
+mediapipe==0.10.9
+numpy==2.2.6
+pillow==12.3.0
+faster-whisper==1.2.1
+sounddevice==0.5.5
+requests==2.34.2
+pywin32==312
 
 # 외부 요소 (pip로 설치되지 않음)
 #  - Ollama 설치 후 모델 받기: ollama pull qwen2.5:3b-instruct
