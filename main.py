@@ -74,7 +74,7 @@ def _run_voice_command(text):
 
 
 # [추가] main이 실행 중 실제로 호출하는 명령 이름 - 콘솔로 등록할 때 이 밖의 이름이면 경고
-KNOWN_COMMAND_NAMES = ["swipe_up", "swipe_down", "close_confirm", "away", "back"] + PINCH_SLOT_NAMES
+KNOWN_COMMAND_NAMES = ["swipe_up", "swipe_down", "close_confirm", "away", "back", "nod", "shake"] + PINCH_SLOT_NAMES
 
 
 # [추가] 콘솔 명령 등록 - main 실행 중에 "이름: 하고 싶은 일"을 입력하면 commandmodule에 저장.
@@ -155,6 +155,8 @@ def run_assistant():
 
     # [추가] 자리 비움 rising/falling edge용 이전 상태 기억
     prev_away = False
+    prev_nod = False
+    prev_shake = False
 
     # [추가] 음성 명령 트리거(웨이크워드 / 손등 3초) rising edge용 이전 상태 기억
     prev_wake_word     = False
@@ -335,6 +337,18 @@ def run_assistant():
                 ok, _ = commandmodule.execute_command(name)
                 label = "자리 비움" if away_edge else "자리 복귀"
                 _log("포즈", f"{label} ({'사용자 정의 명령 실행' if ok else '등록된 명령 없음'})")
+
+            # [추가] 고개 끄덕임("nod") / 가로젓기("shake") → 등록된 명령이 있을 때만 실행.
+            # 창 닫기 확인 중(pending_close)에는 예/아니오 응답으로만 쓰고 명령은 실행하지 않는다.
+            nod_edge   = pose_res["nod"]   and not prev_nod
+            shake_edge = pose_res["shake"] and not prev_shake
+            prev_nod   = pose_res["nod"]
+            prev_shake = pose_res["shake"]
+            if not pending_close:
+                for edge, name, label in ((nod_edge, "nod", "끄덕임"), (shake_edge, "shake", "가로젓기")):
+                    if edge:
+                        ok, _ = commandmodule.execute_command(name)
+                        _log("포즈", f"{label} ({'사용자 정의 명령 실행' if ok else '등록된 명령 없음'})")
 
             # [수정] 음성 명령 트리거 처리
             # - 웨이크워드: VoiceModule이 스스로 녹음을 시작하고 무음 감지로 알아서
