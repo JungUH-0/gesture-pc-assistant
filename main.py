@@ -10,8 +10,10 @@
 #  최종적으로 닫기/취소를 결정한다.
 # ============================================================
 
+import os
 import time
 import threading
+from PIL import ImageGrab  # [추가] ㅡ자 자세로 화면 캡처
 
 from cameramodule import CameraModule, PINCH_SLOTS
 from posemodule import PoseModule  # [추가] 전신 포즈 인식 (포즈 모드)
@@ -156,6 +158,7 @@ def run_assistant():
     # [추가] 자리 비움 rising/falling edge용 이전 상태 기억
     prev_away = False
     prev_nod = False
+    prev_t_pose = False
     prev_shake = False
 
     # [추가] 음성 명령 트리거(웨이크워드 / 손등 3초) rising edge용 이전 상태 기억
@@ -349,6 +352,18 @@ def run_assistant():
                     if edge:
                         ok, _ = commandmodule.execute_command(name)
                         _log("포즈", f"{label} ({'사용자 정의 명령 실행' if ok else '등록된 명령 없음'})")
+
+            # [추가] 양팔 ㅡ자(포즈 모드) → 화면 캡처. captures 폴더에 PNG로 저장.
+            t_pose_edge = pose_res["t_pose"] and not prev_t_pose
+            prev_t_pose = pose_res["t_pose"]
+            if t_pose_edge:
+                try:
+                    os.makedirs("captures", exist_ok=True)
+                    path = os.path.join("captures", time.strftime("capture_%Y%m%d_%H%M%S.png"))
+                    ImageGrab.grab().save(path)
+                    _log("포즈", f"ㅡ자 자세 - 화면 캡처 저장: {path}")
+                except Exception as e:
+                    _log("포즈", f"화면 캡처 실패: {e}")
 
             # [수정] 음성 명령 트리거 처리
             # - 웨이크워드: VoiceModule이 스스로 녹음을 시작하고 무음 감지로 알아서

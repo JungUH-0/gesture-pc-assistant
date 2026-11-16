@@ -73,6 +73,15 @@ HANDS_TOGETHER_SHOULDER_RATIO = 0.5
 
 MIN_SHOULDER_WIDTH = 1e-6  # 0으로 나누기 방지
 
+# ── 팔 벌리기(ㅡ자, T자) 판정 → 화면 캡처용 ─────────────────
+# 양팔을 옆으로 쭉 뻗어 어깨 높이에 일직선이 되는 자세를 T_POSE_HOLD_SEC 동안 유지하면 인정.
+# 모든 거리는 어깨 너비 기준 비율이라 카메라와의 거리와 무관하다.
+T_POSE_MIN_REACH    = 1.0   # 어깨에서 손목까지 바깥쪽으로 뻗은 거리 (어깨 너비 대비)
+T_POSE_MAX_HEIGHT   = 0.4   # 손목·팔꿈치가 어깨 높이에서 벗어날 수 있는 최대 폭 (어깨 너비 대비)
+T_POSE_HOLD_SEC     = 1.0   # 자세를 유지해야 하는 시간 (지나가다 걸리는 것 방지)
+T_POSE_COOLDOWN_SEC = 3.0   # 한 번 인정한 뒤 다시 인정하기까지의 최소 간격
+T_POSE_EVENT_HOLD_SEC = 0.3  # 결과값을 True로 유지하는 시간 (main의 0.02초 폴링이 놓치지 않게)
+
 # ── 고개 끄덕임(예) / 가로젓기(아니오) 판정 ─────────────────
 # 최근 HEAD_WINDOW_SEC 동안의 머리 값을 모아, 한 방향으로 움직였다가 되돌아오는 횟수
 # (swing)가 HEAD_MIN_SWINGS 이상이면 인정한다. 한 번 숙이거나 돌린 것만으로는 인정하지 않음.
@@ -364,6 +373,33 @@ def get_hands_together(landmarks):
     return (wrist_dist / shoulder_width) < HANDS_TOGETHER_SHOULDER_RATIO
 
 
+def get_t_pose(landmarks):
+    """
+    양팔을 옆으로 뻗어 어깨 높이에 ㅡ자로 펴졌는지 판정.
+    어깨·팔꿈치·손목이 모두 보여야 하고, 손목과 팔꿈치가 어깨 높이 근처이며,
+    손목이 어깨보다 바깥쪽으로 T_POSE_MIN_REACH 이상 나가 있어야 한다.
+    """
+    ls, rs = landmarks[LEFT_SHOULDER], landmarks[RIGHT_SHOULDER]
+    sw = ((ls.x - rs.x) ** 2 + (ls.y - rs.y) ** 2) ** 0.5
+    if sw < MIN_SHOULDER_WIDTH:
+        return False
+    mid_x = (ls.x + rs.x) / 2
+
+    for shoulder, elbow, wrist in ((ls, landmarks[LEFT_ELBOW], landmarks[LEFT_WRIST]),
+                                   (rs, landmarks[RIGHT_ELBOW], landmarks[RIGHT_WRIST])):
+        if min(shoulder.visibility, elbow.visibility, wrist.visibility) < MIN_VISIBILITY:
+            return False
+        if abs(wrist.y - shoulder.y) > T_POSE_MAX_HEIGHT * sw:
+            return False
+        if abs(elbow.y - shoulder.y) > T_POSE_MAX_HEIGHT * sw:
+            return False
+        # 몸 중심에서 바깥쪽 방향(좌우 어느 쪽이든)으로 어깨보다 충분히 멀어야 함
+        side = 1 if shoulder.x >= mid_x else -1
+        if side * (wrist.x - shoulder.x) < T_POSE_MIN_REACH * sw:
+            return False
+    return True
+
+
 class PoseModule:
     """
     전신(상체) 포즈를 인식하는 모듈.
@@ -387,8 +423,13 @@ class PoseModule:
             "nod"            : False,  # 고개 끄덕임 (예) - HEAD_EVENT_HOLD_SEC 동안 True 유지
             "shake"          : False,  # 고개 가로젓기 (아니오)
             "away"           : False,  # 자리 비움 - 사람이 AWAY_AFTER_SEC 이상 안 보이는 동안 True
+            "t_pose"         : False,  # 양팔 ㅡ자 유지 (화면 캡처용) - T_POSE_EVENT_HOLD_SEC 동안 True 유지
         }
         self._lock = threading.Lock()
+
+        self._t_pose_since = None   # ㅡ자 자세가 시작된 시각
+        self._t_pose_until = 0.0
+        self._t_pose_last  = 0.0    # 마지막으로 인정한 시각
 
         self._head = HeadMotionDetector()
         self._nod_until   = 0.0
@@ -474,6 +515,23 @@ class PoseModule:
             )
 
             hands_together = get_hands_together(landmarks)
+
+            # ㅡ자 자세를 T_POSE_HOLD_SEC 동안 유지하면 이벤트 (쿨다운 중이면 무시)
+            if get_t_pose(landmarks):
+                if self._t_pose_since is None:
+                    self._t_pose_since = now
+                held = now - self._t_pose_since
+                if held >= T_POSE_HOLD_SEC and now - self._t_pose_last >= T_POSE_COOLDOWN_SEC:
+                    self._t_pose_until = now + T_POSE_EVENT_HOLD_SEC
+                    self._t_pose_last  = now
+                    self._t_pose_since = None
+                    self._debug_note("EVENT t_pose")
+                elif self._t_pose_since is not None:
+                    cv.putText(frame_vis, f"T-POSE {min(held / T_POSE_HOLD_SEC, 1.0) * 100:.0f}%",
+                               (10, 240), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            else:
+                self._t_pose_since = None
+
             features, reason = extract_pose_features(landmarks)
             detected = features is not None
 
@@ -535,6 +593,7 @@ class PoseModule:
             self._debug_log(features, reason, head_pitch)
         else:
             self._head.clear()
+            self._t_pose_since = None
 
         if head_event == "nod":
             self._nod_until = now + HEAD_EVENT_HOLD_SEC
@@ -561,6 +620,7 @@ class PoseModule:
             self.result["nod"]            = now < self._nod_until
             self.result["shake"]          = now < self._shake_until
             self.result["away"]           = away
+            self.result["t_pose"]         = now < self._t_pose_until
 
     def get_result(self):
         """현재 감지 결과 반환 (스레드 안전)"""
@@ -577,6 +637,9 @@ class PoseModule:
             self.result["nod"]            = False
             self.result["shake"]          = False
             self.result["away"]           = False
+            self.result["t_pose"]         = False
         self._head.clear()
         self._nod_until = self._shake_until = 0.0
+        self._t_pose_since = None
+        self._t_pose_until = 0.0
         self._last_seen_time = time.time()

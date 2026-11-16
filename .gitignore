@@ -4,6 +4,9 @@ debug_*.txt
 # 사용자가 등록한 명령 (개인 설정) - 예시는 commands.example.json 참고
 commands.json
 
+# 화면 캡처 결과 (ㅡ자 자세)
+captures/
+
 # 테스트 산출물
 clap_test_result_*.png
 

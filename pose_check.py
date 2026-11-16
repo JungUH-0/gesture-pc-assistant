@@ -24,13 +24,15 @@ def _log(tag, msg):
 
 def _watch(pose, cam):
     """pose 결과를 폴링해서 이벤트가 켜지는 순간(rising edge)만 콘솔에 출력"""
-    prev = {"nod": False, "shake": False, "away": False}
+    prev = {"nod": False, "shake": False, "away": False, "t_pose": False}
     while cam.running:
         res = pose.get_result()
         if res["nod"] and not prev["nod"]:
             _log("이벤트", "끄덕임 (예)")
         if res["shake"] and not prev["shake"]:
             _log("이벤트", "가로젓기 (아니오)")
+        if res["t_pose"] and not prev["t_pose"]:
+            _log("이벤트", "ㅡ자 자세 (main에서는 화면 캡처)")
         if res["away"] and not prev["away"]:
             _log("이벤트", "자리 비움")
         if prev["away"] and not res["away"]:
