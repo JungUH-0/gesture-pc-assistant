@@ -68,6 +68,7 @@ class VoiceModule:
             "command_text" : None,   # 녹음이 끝나고 변환된 명령 문장 (소비 후 None으로 리셋해줘야 함)
         }
         self._lock = threading.Lock()
+        self.check_times = []  # 웨이크워드 검사 1회당 걸린 시간(초) - perf_check.py에서 읽음
 
         print("[VoiceModule] Whisper 모델 로딩 중 (최초 1회, 시간이 좀 걸릴 수 있음)...")
         self._model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
@@ -163,10 +164,12 @@ class VoiceModule:
                 with self._buffer_lock:
                     audio = self._buffer.copy()
 
+                check_start = time.time()
                 segments, _ = self._model.transcribe(
                     audio, language="ko", vad_filter=True,
                 )
                 text = "".join(seg.text for seg in segments).strip()
+                self.check_times.append(time.time() - check_start)  # 성능 진단용 (perf_check.py)
 
                 wake_detected = bool(text) and WAKE_WORD in text
 

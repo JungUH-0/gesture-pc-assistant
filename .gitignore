@@ -7,6 +7,13 @@ commands.json
 # 화면 캡처 결과 (ㅡ자 자세)
 captures/
 
+# 문서: docs에서는 md(와 md가 쓰는 이미지)만 올리고, 변환본(Word·PPT)은 올리지 않음
+docs/**/*.docx
+docs/**/*.pptx
+# 문서 변환·생성 도구(빌드 스크립트)도 올리지 않음
+docs/tools/
+docs/**/build_*.js
+
 # 테스트 산출물
 clap_test_result_*.png
 
