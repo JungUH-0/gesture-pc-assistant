@@ -1,0 +1,275 @@
+# ============================================================
+#  개인 AI 비서 - 명령 등록/실행 모듈 (로컬 LLM 기반)
+#  사용자가 자연어로 입력한 명령을 Ollama(qwen2.5:3b-instruct)로 해석해서
+#  {gesture, action, target} 형태의 구조화된 매핑으로 commands.json에 저장한다.
+#  실시간 제스처 인식 루프(main.py)와는 분리되어, 명령을 등록/수정할 때만
+#  이 스크립트를 직접 실행한다. LLM 호출은 여기서 끝나고, 실제 실행은
+#  windowcontrol.py의 기존 함수로 위임한다(LLM이 시스템을 직접 건드리지 않음).
+# ============================================================
+
+import json
+import os
+import requests
+
+import windowcontrol
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL_NAME = "qwen2.5:3b-instruct"
+# [추가] 모델이 VRAM에서 내려갔다가 다시 올라오는 경우 첫 응답이 오래 걸려서 넉넉히 잡음
+OLLAMA_TIMEOUT_SEC = 60
+COMMANDS_FILE = os.path.join(os.path.dirname(__file__), "commands.json")
+
+# action별로 필요한 파라미터 정의 - LLM 출력 검증 및 프롬프트 스키마로 함께 사용
+ALLOWED_ACTIONS = {
+    "minimize_window": [],
+    "close_window": [],
+    "restore_window": [],
+    "turn_off_monitor": [],
+    "turn_on_monitor": [],
+    "open_app": ["target"],
+    "press_shortcut": ["target"],   # [추가] 키보드 단축키 입력
+    "press_media_key": ["target"],  # [추가] 볼륨/재생 등 미디어 키 입력
+    "open_url": ["target"],         # [추가] 화이트리스트에 등록된 사이트 열기
+    "search_web": ["target"],       # [추가] target = 검색어(자유 텍스트). 구글 검색 주소로만 열림
+}
+
+# [추가] target이 화이트리스트가 아니라 자유 텍스트인 action.
+# 검증은 windowcontrol.build_search_url에서 한다(고정 주소 + URL 인코딩 + 길이 제한).
+FREE_TEXT_ACTIONS = {"search_web"}
+
+# [추가] target이 필요한 action마다 어떤 화이트리스트로 검증할지 매핑
+# (windowcontrol.py에 있는 화이트리스트를 그대로 재사용 - LLM이 만든 임의 문자열이
+#  그대로 실행되지 않도록 여기서도 한 번 더 걸러냄)
+TARGET_WHITELISTS = {
+    "open_app": windowcontrol.ALLOWED_APPS,
+    "press_shortcut": windowcontrol.ALLOWED_SHORTCUTS,
+    "press_media_key": windowcontrol.ALLOWED_MEDIA_KEYS,
+    "open_url": windowcontrol.ALLOWED_URLS,
+}
+
+SYSTEM_PROMPT = f"""너는 사용자의 자연어 명령을 아래 JSON 스키마로만 변환하는 파서다.
+다른 설명 없이 JSON 객체 하나만 출력해라.
+
+허용된 action과 필요한 파라미터:
+{json.dumps(ALLOWED_ACTIONS, ensure_ascii=False)}
+
+각 action의 target으로 쓸 수 있는 값 (반드시 이 중 하나):
+- open_app: {", ".join(windowcontrol.ALLOWED_APPS.keys())}
+- press_shortcut: {", ".join(windowcontrol.ALLOWED_SHORTCUTS.keys())}
+- press_media_key: {", ".join(windowcontrol.ALLOWED_MEDIA_KEYS.keys())}
+- open_url: {", ".join(windowcontrol.ALLOWED_URLS.keys())}
+- search_web: 검색할 말 자체 (자유 텍스트, "검색해줘" 같은 명령어는 빼고 찾을 내용만)
+
+주의:
+- target 목록에 있는 값(예: close_tab, mute)을 action 자리에 쓰면 안 된다. action은 반드시 위 action 목록 중 하나여야 한다.
+- "음소거"/"뮤트"/"소리 꺼줘"는 press_media_key(target=mute)이지, turn_off_monitor(모니터 끄기)가 아니다.
+- "탭 닫기"는 press_shortcut(target=close_tab)이다.
+- "크롬 열어줘"는 open_app이고, 무언가를 "검색해줘/찾아줘"는 search_web이다.
+
+예시:
+사용자 명령: 탭 닫아줘
+{{"action": "press_shortcut", "target": "close_tab"}}
+
+사용자 명령: 소리 꺼줘
+{{"action": "press_media_key", "target": "mute"}}
+
+사용자 명령: 화면 꺼줘
+{{"action": "turn_off_monitor", "target": null}}
+
+사용자 명령: 유튜브 켜줘
+{{"action": "open_url", "target": "youtube"}}
+
+사용자 명령: 크롬에서 오늘 날씨 검색해줘
+{{"action": "search_web", "target": "오늘 날씨"}}
+
+사용자 명령: 파이썬 강의 찾아줘
+{{"action": "search_web", "target": "파이썬 강의"}}
+
+출력 형식(JSON만):
+{{"action": "<action 이름>", "target": "<필요시 대상, 없으면 null>"}}
+
+목록에 없는 동작이거나 해석할 수 없으면 action을 "unknown"으로 출력해라.
+"""
+
+
+def _ask_llm(user_text):
+    """
+    자연어 명령을 Ollama에 보내 구조화된 JSON으로 변환 요청.
+    반환값: (파싱된 dict, None) 또는 (None, 에러 메시지)
+
+    [수정] 예전에는 예외를 그대로 위로 던져서, Ollama 응답이 늦거나 서버가 꺼져
+    있으면 main.py의 메인 루프에서 그대로 터지며 프로그램 전체가 종료됐다.
+    비서가 통째로 죽는 것보다 그 명령만 실패하는 게 맞으므로 여기서 다 잡는다.
+    """
+    prompt = f"{SYSTEM_PROMPT}\n\n사용자 명령: {user_text}"
+    try:
+        resp = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL_NAME,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",  # Ollama가 valid JSON만 생성하도록 강제
+                # [추가] 모델을 VRAM에 계속 올려둠. 기본값(5분)으로는 조금만 안 쓰면
+                # 언로드됐다가 다시 올라오느라 첫 응답이 수십 초씩 걸린다.
+                "keep_alive": "30m",
+            },
+            timeout=OLLAMA_TIMEOUT_SEC,
+        )
+        resp.raise_for_status()
+        return json.loads(resp.json()["response"]), None
+    except requests.exceptions.Timeout:
+        return None, f"Ollama 응답이 {OLLAMA_TIMEOUT_SEC}초 안에 오지 않았습니다"
+    except requests.exceptions.ConnectionError:
+        return None, "Ollama에 연결할 수 없습니다 (서버가 꺼져 있는지 확인하세요)"
+    except (ValueError, KeyError) as e:
+        return None, f"Ollama 응답을 해석하지 못했습니다: {e}"
+    except requests.exceptions.RequestException as e:
+        return None, f"Ollama 요청 실패: {e}"
+
+
+def _load_commands():
+    # [수정] 파일이 깨져 있거나 읽기에 실패해도 비서 전체가 죽지 않도록 감쌈.
+    # 이 함수는 제스처가 인식될 때마다(실시간 루프에서) 호출되기 때문에,
+    # 여기서 예외가 나면 main.py의 루프가 통째로 멈춘다.
+    if not os.path.exists(COMMANDS_FILE):
+        return {}
+    try:
+        with open(COMMANDS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"[CommandModule] commands.json을 읽지 못했습니다: {e}")
+        return {}
+
+
+def _save_commands(commands):
+    with open(COMMANDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(commands, f, ensure_ascii=False, indent=2)
+
+
+def _check_target(action, target):
+    """
+    action에 필요한 target을 검증. 문제가 없으면 None, 있으면 에러 메시지를 반환.
+    register_command와 execute_text가 같은 검증을 쓰도록 한곳에 모음.
+    """
+    if "target" not in ALLOWED_ACTIONS[action]:
+        return None
+    if action in FREE_TEXT_ACTIONS:
+        url, err = windowcontrol.build_search_url(target)
+        return err if url is None else None
+    whitelist = TARGET_WHITELISTS.get(action, {})
+    if not target or target.strip().lower() not in whitelist:
+        return "target을 알아듣지 못했습니다"
+    return None
+
+
+def register_command(gesture_name, user_text):
+    """자연어 명령을 해석해서 gesture_name에 대한 동작으로 저장"""
+    parsed, err = _ask_llm(user_text)
+    if parsed is None:
+        return False, err
+    action = parsed.get("action")
+    target = parsed.get("target")
+
+    if action not in ALLOWED_ACTIONS:
+        return False, f"인식 실패 또는 지원하지 않는 동작입니다: {parsed}"
+
+    problem = _check_target(action, target)
+    if problem:
+        return False, f"{problem}: {parsed}"
+
+    commands = _load_commands()
+    commands[gesture_name] = {"action": action, "target": target}
+    _save_commands(commands)
+    return True, commands[gesture_name]
+
+
+def _run_action(action, target):
+    """
+    이미 해석된 {action, target}을 실제로 실행 - execute_command(제스처 슬롯)와
+    execute_text(자유 텍스트 즉시 실행)가 이 함수를 공유해서 씀
+    """
+    if action == "minimize_window":
+        windowcontrol.minimize_active_window()
+    elif action == "close_window":
+        windowcontrol.close_active_window()
+    elif action == "restore_window":
+        windowcontrol.restore_last_window()
+    elif action == "turn_off_monitor":
+        windowcontrol.turn_off_monitor()
+    elif action == "turn_on_monitor":
+        windowcontrol.turn_on_monitor()
+    elif action == "open_app":
+        return windowcontrol.open_app(target)
+    elif action == "press_shortcut":
+        return windowcontrol.press_shortcut(target)
+    elif action == "press_media_key":
+        return windowcontrol.press_media_key(target)
+    elif action == "open_url":
+        return windowcontrol.open_url(target)
+    elif action == "search_web":
+        return windowcontrol.search_web(target)
+    else:
+        return False, f"알 수 없는 action: {action}"
+
+    return True, None
+
+
+def execute_command(gesture_name):
+    """
+    저장된 매핑에서 gesture_name에 해당하는 동작을 실제로 실행.
+    main.py 같은 실시간 루프에서, 제스처가 인식됐을 때 호출하는 용도.
+    """
+    commands = _load_commands()
+    cmd = commands.get(gesture_name)
+    if cmd is None:
+        return False, "등록된 명령이 없습니다"
+    return _run_action(cmd.get("action"), cmd.get("target"))
+
+
+def execute_text(user_text):
+    """
+    자연어 명령을 그 자리에서 해석해서 바로 실행 (제스처 슬롯에 등록하지 않는
+    1회성 실행). 음성 명령처럼, 미리 등록해두지 않고 그때그때 자유롭게
+    명령할 때 사용.
+    """
+    parsed, err = _ask_llm(user_text)
+    if parsed is None:
+        return False, err
+    action = parsed.get("action")
+    target = parsed.get("target")
+
+    if action not in ALLOWED_ACTIONS:
+        return False, f"인식 실패 또는 지원하지 않는 동작입니다: {parsed}"
+
+    problem = _check_target(action, target)
+    if problem:
+        return False, f"{problem}: {parsed}"
+
+    return _run_action(action, target)
+
+
+# ── 테스트/등록용 실행 ─────────────────────────────────────
+if __name__ == "__main__":
+    print("[CommandModule] 명령 등록 - Ctrl+C로 종료")
+    while True:
+        try:
+            gesture = input("\n제스처 이름 (예: pinch_middle, pinch_ring, swipe_up): ").strip()
+            if not gesture:
+                continue
+            text = input("무엇을 하고 싶으세요? (자연어로 입력): ").strip()
+            if not text:
+                continue
+
+            ok, result = register_command(gesture, text)
+            if ok:
+                print(f"등록 완료: {gesture} -> {result}")
+                run = input("지금 바로 실행해볼까요? (y/n): ").strip().lower()
+                if run == "y":
+                    ok2, err = execute_command(gesture)
+                    print("실행 성공" if ok2 else f"실행 실패: {err}")
+            else:
+                print(f"등록 실패: {result}")
+        except KeyboardInterrupt:
+            print("\n[CommandModule] 종료")
+            break
