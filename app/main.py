@@ -11,6 +11,7 @@
 # ============================================================
 
 import os
+import queue
 import time
 import threading
 from PIL import ImageGrab  # [추가] ㅡ자 자세로 화면 캡처
@@ -29,7 +30,7 @@ PINCH_SLOT_NAMES = [name for name, _ in PINCH_SLOTS]
 # 둘을 동시에 돌리면 FPS가 크게 떨어지고 제스처끼리 충돌해서, 한 번에 하나만 켠다.
 MODE_HAND = "hand"
 MODE_POSE = "pose"
-MODE_SWITCH_COOLDOWN_SEC = 1.5  # 전환 직후 같은 박수로 곧바로 되돌아가는 것 방지
+MODE_SWITCH_COOLDOWN_SEC = 5.0  # 전환 직후 이 시간 동안은 모드 전환을 인식하지 않음 (1.5 → 5.0: 3초 만에 되돌아가는 오전환 방지)
 
 # [추가] 박수 소리와 "양손 모임"이 정확히 같은 순간에 잡히길 요구하면 거의 안 맞는다:
 #  - clap 신호는 약 30ms만 유지되는데 카메라는 33ms에 한 프레임이라 겹칠 확률이 낮고,
@@ -64,6 +65,31 @@ def set_event_handler(fn):
     _event_handler = fn
 
 
+# [추가] 구조화된 UI 이벤트 수신 함수. 로그 문장을 해석하지 않고 알림·팝업을 만들 수 있게,
+# 의미 있는 순간마다 이름과 데이터를 넘긴다. 지정하지 않으면 아무 일도 일어나지 않는다.
+#   mode_changed(mode)          손/포즈 모드 전환     away() / back()   자리 비움 / 복귀
+#   capture_saved(path) / capture_failed(error)       ㅡ자 자세 화면 캡처
+#   close_confirm_start(title, timeout) / close_confirm_end(result)   창 닫기 확인 시작·끝
+#   voice_listening()           음성 명령 듣기 시작
+#   voice_command_result(ok, text, error)             음성 명령 실행 결과
+_ui_handler = None
+
+
+def set_ui_handler(fn):
+    """fn(name, **data)를 UI 이벤트 수신 함수로 등록. None이면 해제."""
+    global _ui_handler
+    _ui_handler = fn
+
+
+def _emit(name, **data):
+    if _ui_handler is None:
+        return
+    try:
+        _ui_handler(name, **data)
+    except Exception as e:  # UI 쪽 오류가 비서 루프를 죽이지 않게
+        _log("시스템", f"UI 이벤트 처리 오류 ({name}): {e}")
+
+
 # [추가] 콘솔에 시각 태그를 붙여 어느 시점에 무슨 신호가 찍혔는지 구분하기 쉽게 함
 def _log(tag, msg):
     if _event_handler is not None:
@@ -88,8 +114,10 @@ def _run_voice_command(text):
     try:
         ok, err = commandmodule.execute_text(text)
         _log("음성", "명령 실행 완료" if ok else f"명령 실행 실패: {err}")
+        _emit("voice_command_result", ok=bool(ok), text=text, error=None if ok else str(err))
     except Exception as e:
         _log("음성", f"명령 실행 중 오류: {e}")
+        _emit("voice_command_result", ok=False, text=text, error=str(e))
 
 
 # [추가] main이 실행 중 실제로 호출하는 명령 이름 - 콘솔로 등록할 때 이 밖의 이름이면 경고
@@ -138,12 +166,13 @@ def _console_register_loop():
 # [수정] 예전 run_assistant()의 이벤트 루프 본문. 모듈 생성·스레드 시작은 Assistant.start()가 하고,
 # 이 함수는 만들어진 모듈을 받아서 신호를 처리한다. (본문은 들여쓰기·동작 모두 그대로)
 # stop_event가 켜지거나 카메라 스레드가 끝나면(카메라 창에서 'q') 루프를 마치고 정리한다.
-def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event):
+def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event, answer_queue):
     global _quiet_logs
     no_hand_since = None  # 손이 안 보이기 시작한 시각 (None이면 보이는 중)
 
     pending_close        = False
     pending_close_since  = None
+    close_target         = None   # [추가] 닫기 확인을 시작한 순간의 대상 창 (예 → 이 창을 닫음)
 
     # [추가] 인식 모드 상태 - 시작은 손동작 모드
     mode = MODE_HAND
@@ -260,6 +289,7 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event):
                 mode_switch_armed     = False
                 cam.set_mode(mode)
                 _log("모드", f"{'전신 포즈' if mode == MODE_POSE else '손동작'} 모드로 전환")
+                _emit("mode_changed", mode=mode)
 
             # [수정] 예/아니오는 엄지척/엄지다운 담당 (박수는 모드 전환 전용이 됐고,
             # 눈 깜빡임은 현재 비활성화 상태라 blink/double_blink는 항상 False임)
@@ -319,25 +349,45 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event):
                 no_source = "카메라-엄지다운"
 
             if pending_close:
-                if yes_edge:
+                # [추가] 확인 팝업의 예/아니오 버튼 응답 (제스처 응답과 같은 효력)
+                popup_answer = None
+                try:
+                    popup_answer = answer_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                close_yes = yes_edge or popup_answer is True
+                close_no  = no_edge or popup_answer is False
+                if close_yes:
                     # [수정] "닫기"도 commandmodule에 등록된 사용자 정의 명령이 있으면
-                    # 그걸 실행, 없으면 기본 동작(실제 창 닫기)으로 폴백
+                    # 그걸 실행, 없으면 기본 동작(확인을 시작한 순간의 대상 창 닫기)으로 폴백
                     ok, _ = commandmodule.execute_command("close_confirm")
                     if not ok:
-                        windowcontrol.close_active_window()
+                        windowcontrol.close_window(close_target)
                     pending_close = False
-                    _log("확정", f"{'사용자 정의 명령 실행' if ok else '창 닫기 실행'} ({yes_source})")
-                elif no_edge:
+                    _log("확정", f"{'사용자 정의 명령 실행' if ok else '창 닫기 실행'} "
+                                 f"({'팝업 버튼' if popup_answer is True else yes_source})")
+                    _emit("close_confirm_end", result="yes")
+                elif close_no:
                     pending_close = False
-                    _log("취소", f"창 닫기 취소 ({no_source})")
+                    _log("취소", f"창 닫기 취소 ({'팝업 버튼' if popup_answer is False else no_source})")
+                    _emit("close_confirm_end", result="no")
                 elif time.time() - pending_close_since > CLOSE_CONFIRM_TIMEOUT_SEC:
                     pending_close = False
                     _log("취소", "응답 없음 - 자동 취소")
+                    _emit("close_confirm_end", result="timeout")
             else:
                 if cam_res["close_request"]:
                     pending_close       = True
                     pending_close_since = time.time()
-                    _log("확인 필요", "창을 닫을까요? 눈 1번/박수 1번=예, 더블=아니오 (5초 내 응답)")
+                    close_target        = windowcontrol.get_target_window()  # 이 창을 닫게 됨
+                    while not answer_queue.empty():  # 이전 확인에서 남은 응답은 버림
+                        try:
+                            answer_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    _log("확인 필요", "창을 닫을까요? 엄지척·끄덕임=예, 엄지다운·가로젓기=아니오 (5초 내 응답)")
+                    _emit("close_confirm_start", title=windowcontrol.get_window_title(close_target),
+                          timeout=CLOSE_CONFIRM_TIMEOUT_SEC)
                 elif yes_edge:
                     _gesture_log("신호", f"예 / 동의 ({yes_source})")
                 elif no_edge:
@@ -379,6 +429,7 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event):
                 ok, _ = commandmodule.execute_command(name)
                 label = "자리 비움" if away_edge else "자리 복귀"
                 _log("포즈", f"{label} ({'사용자 정의 명령 실행' if ok else '등록된 명령 없음'})")
+                _emit(name, executed=bool(ok))
 
             # [추가] 고개 끄덕임("nod") / 가로젓기("shake") → 등록된 명령이 있을 때만 실행.
             # 창 닫기 확인 중(pending_close)에는 예/아니오 응답으로만 쓰고 명령은 실행하지 않는다.
@@ -401,8 +452,10 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event):
                     path = os.path.join("captures", time.strftime("capture_%Y%m%d_%H%M%S.png"))
                     ImageGrab.grab().save(path)
                     _log("포즈", f"ㅡ자 자세 - 화면 캡처 저장: {path}")
+                    _emit("capture_saved", path=os.path.abspath(path))
                 except Exception as e:
                     _log("포즈", f"화면 캡처 실패: {e}")
+                    _emit("capture_failed", error=str(e))
 
             # [수정] 음성 명령 트리거 처리
             # - 웨이크워드: VoiceModule이 스스로 녹음을 시작하고 무음 감지로 알아서
@@ -411,12 +464,14 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event):
             #   프레임 손 방향을 지켜보다가 손등 자세가 풀리는 순간 직접 종료시킴
             if wake_word_edge:
                 _log("음성", f"웨이크워드 감지 (\"{voice_res['last_text']}\") - 명령 녹음 시작")
+                _emit("voice_listening")
             if voice_trigger_edge and not recording_manual and not voice_res["recording"]:
                 # voice_res["recording"] 체크: 웨이크워드로 이미 녹음 중이면 겹쳐서
                 # 시작하지 않음 (진행 중이던 vad 녹음 버퍼가 지워지는 것 방지)
                 voice.start_command_recording(mode="manual")
                 recording_manual = True
                 _log("음성", "손등 유지 감지 - 명령 녹음 시작 (손을 떼면 종료)")
+                _emit("voice_listening")
             if recording_manual and cam_res["hand_orientation"] != "back":
                 voice.stop_command_recording()
                 recording_manual = False
@@ -469,6 +524,7 @@ class Assistant:
         self._loop_thread = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
+        self._answer_queue = queue.Queue()   # 확인 팝업 버튼 응답 (True=예, False=아니오)
 
     def start(self):
         """모듈을 만들고(Whisper 로딩으로 수십 초 걸릴 수 있음) 스레드를 시작한다."""
@@ -491,13 +547,18 @@ class Assistant:
         self._loop_thread = threading.Thread(
             target=_run_loop,
             args=(self.cam, self.pose, self.audio, self.voice, cam_thread,
-                  self._stop_event, self._pause_event),
+                  self._stop_event, self._pause_event, self._answer_queue),
             daemon=True,
         )
         self._loop_thread.start()
 
     def is_running(self):
         return self._loop_thread is not None and self._loop_thread.is_alive()
+
+    # ── 창 닫기 확인 팝업의 버튼 응답 ──────────────────────
+    def answer_close_confirm(self, yes):
+        """확인 팝업의 예(True)/아니오(False) 버튼. 닫기 확인 중이 아니면 무시됨."""
+        self._answer_queue.put(bool(yes))
 
     # ── 일시정지 / 재개 ────────────────────────────────────
     def pause(self):

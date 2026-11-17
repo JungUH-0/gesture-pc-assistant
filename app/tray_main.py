@@ -48,11 +48,14 @@ log("=== 트레이 앱 시작 ===")
 try:
     import pystray
     from PIL import Image, ImageDraw
+    import requests
     import win32api
     import win32event
     import winerror
 
+    import commandmodule
     import main as assistant_main
+    from popup import ClosePopup
 except Exception:
     log("필요한 모듈을 불러오지 못했습니다:\n" + traceback.format_exc())
     raise
@@ -95,6 +98,82 @@ assistant = assistant_main.Assistant(show_window=False, quit_on_q=False)
 assistant_main.set_event_handler(lambda tag, msg: log(f"[{tag}] {msg}"))
 
 state = {"phase": "loading", "quitting": False}
+tray_icon = None   # 실행 시 만들어진 pystray 아이콘 (알림을 띄우는 데 사용)
+popup = ClosePopup()
+FIRST_RUN_FLAG = os.path.join(APP_DIR, ".first_run_done")
+
+
+# ── 알림(토스트)과 팝업 ─────────────────────────────────────
+def notify(message, title="개인 AI 비서"):
+    """윈도우 알림. 길이 제한(제목 63자·내용 255자)에 맞춰 자른다."""
+    if tray_icon is None:
+        return
+    try:
+        tray_icon.notify(message[:250], title[:60])
+    except Exception as e:
+        log(f"알림을 띄우지 못했습니다: {e}")
+
+
+def on_ui_event(name, **d):
+    """main.py가 넘기는 구조화 이벤트를 알림·팝업으로 바꾼다 (이벤트 목록은 main.py 참고)"""
+    if name == "mode_changed":
+        notify("손동작 모드" if d["mode"] == assistant_main.MODE_HAND else "전신 포즈 모드", "모드 전환")
+    elif name == "away":
+        notify("자리 비움을 감지했습니다" + (" (등록된 명령을 실행했습니다)" if d.get("executed") else ""), "자리 비움")
+    elif name == "back":
+        notify("자리에 돌아왔습니다" + (" (등록된 명령을 실행했습니다)" if d.get("executed") else ""), "자리 복귀")
+    elif name == "capture_saved":
+        notify(f"화면을 저장했습니다\n{d['path']}", "화면 캡처")
+    elif name == "capture_failed":
+        notify(f"화면 캡처에 실패했습니다: {d['error']}", "화면 캡처")
+    elif name == "voice_listening":
+        notify("듣고 있습니다", "음성 명령")
+    elif name == "voice_command_result":
+        if d["ok"]:
+            notify(f"실행했습니다: {d['text']}", "음성 명령")
+        else:
+            notify(f"실행하지 못했습니다: {d['error']}", "음성 명령")
+    elif name == "close_confirm_start":
+        popup.show(d["title"], d["timeout"], assistant.answer_close_confirm)
+    elif name == "close_confirm_end":
+        popup.close()
+
+
+assistant_main.set_ui_handler(on_ui_event)
+
+
+# ── 시작 시 안내 ────────────────────────────────────────────
+def check_ollama():
+    """Ollama가 꺼져 있거나 모델이 없으면 사용자에게 보여 줄 안내 문장을, 정상이면 None을 반환"""
+    base = commandmodule.OLLAMA_URL.rsplit("/api/", 1)[0]
+    try:
+        r = requests.get(base + "/api/tags", timeout=3)
+        names = [m.get("name") for m in r.json().get("models", [])]
+    except Exception:
+        return "Ollama가 실행 중이 아닙니다. 명령 등록과 음성 명령 실행에는 Ollama가 필요합니다."
+    if commandmodule.MODEL_NAME not in names:
+        return f"모델이 없습니다. 터미널에서 'ollama pull {commandmodule.MODEL_NAME}'을 실행하세요."
+    return None
+
+
+def startup_guide():
+    """첫 실행이면 사용법을 한 번 알리고, Ollama에 문제가 있으면 (실행할 때마다) 알림"""
+    first = not os.path.exists(FIRST_RUN_FLAG)
+    problem = check_ollama()
+    if first:
+        notify("준비되었습니다. 양손을 모아 1초 유지하면 손동작/포즈 모드가 전환됩니다. "
+               "설정과 종료는 작업표시줄 오른쪽 트레이 아이콘 메뉴에서 하세요.", "개인 AI 비서 시작")
+        try:
+            open(FIRST_RUN_FLAG, "w").close()
+        except OSError:
+            pass
+        if problem:
+            time.sleep(6)  # 두 알림이 서로 덮어쓰지 않게 간격을 둠
+    if problem:
+        log(f"Ollama 점검: {problem}")
+        notify(problem, "Ollama 확인 필요")
+    else:
+        log("Ollama 점검: 정상")
 
 
 def refresh(icon):
@@ -173,6 +252,7 @@ def _boot(icon):
         refresh(icon)
         return
     refresh(icon)
+    threading.Thread(target=startup_guide, daemon=True).start()
 
     # 카메라를 열 수 없는 등으로 루프가 스스로 끝나면 오류 상태로 표시
     assistant.wait()
@@ -189,5 +269,6 @@ def _setup(icon):
 
 if __name__ == "__main__":
     icon = pystray.Icon("gesture-pc-assistant", make_icon("loading"), TITLES["loading"], menu)
+    tray_icon = icon
     icon.run(setup=_setup)
     log("=== 트레이 앱 종료 ===")

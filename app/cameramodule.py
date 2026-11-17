@@ -118,7 +118,13 @@ EDGE_RECENT_SEC = 0.3
 ORIENTATION_KO = {"front": "손바닥", "back": "손등", "edge": "손날"}  # [추가] 화면 표시용 한글 라벨
 
 # [추가] 양손이 겹쳐졌는지(박수 동작 보조 판정용) 설정
-HANDS_TOGETHER_THRESHOLD = 0.15  # 두 손 중심점 사이 거리(정규화 좌표)가 이보다 작으면 겹친 것으로 판정 - 실측 후 조정 필요
+HANDS_TOGETHER_THRESHOLD = 0.20  # 두 손 중심점 사이 거리(정규화 좌표)가 이보다 작으면 겹친 것으로 판정 (0.15 → 0.20으로 완화) - 실측 후 조정 필요
+
+# [추가] 손이 맞닿으면 MediaPipe가 두 손을 한 손으로 보고 한쪽 정보를 잃는다. 그때마다
+# "양손 모임"이 꺼지면 모드 전환의 유지 시간(1초)이 계속 초기화되어 전환이 안 되므로,
+# 직전에 두 손이 가까웠다가 한 손만 검출되면 겹쳐서 가려진 것으로 보고 모임을 이어 간다.
+HANDS_LOST_GRACE_SEC = 2.0   # 마지막으로 양손이 보인 뒤 이 시간까지만 모임을 이어 감 (손을 내린 경우를 걸러내는 안전장치)
+HANDS_LOST_NEAR_DIST = 0.25  # 남은 한 손이 두 손의 마지막 중점에서 이 거리 이내일 때만 이어 감
 
 # [추가] 핀치(엄지+검지 집기)로 창 드래그 설정
 PINCH_ON_DIST  = 0.05  # 엄지-검지 거리(정규화 좌표)가 이보다 가까우면 "집기" 시작 - 실측 후 조정 필요
@@ -328,6 +334,11 @@ class CameraModule:
         # 넘겨주는 방식으로 공유한다.
         self.pose_module = pose_module
 
+        # [추가] 양손 모임이 한 손 소실로 끊기지 않게 하는 상태 (HANDS_LOST_* 참고)
+        self._last_two_time     = 0.0    # 마지막으로 양손이 둘 다 검출된 시각
+        self._last_two_mid      = None   # 그때 두 손 중심점의 중점
+        self._last_two_together = False  # 그때 두 손이 가까웠는지
+
         # 손 인식기
         self.hands = mp_hands.Hands(
             max_num_hands=2,
@@ -498,12 +509,25 @@ class CameraModule:
 
         # [추가] 양손이 모두 보이고 두 중심점이 가까우면 "겹침"으로 판정 (박수 보조 판정용)
         hands_together = False
+        now_h = time.time()
         if len(hand_centers) == 2:
             (x1, y1), (x2, y2) = hand_centers
             dist = ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
             hands_together = dist < HANDS_TOGETHER_THRESHOLD
+            self._last_two_time     = now_h
+            self._last_two_mid      = ((x1 + x2) / 2, (y1 + y2) / 2)
+            self._last_two_together = hands_together
             cv.putText(frame_vis, f"hands_dist:{dist:.2f}", (10, 240),
                        cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        elif (len(hand_centers) == 1 and self._last_two_together and self._last_two_mid is not None
+                and now_h - self._last_two_time < HANDS_LOST_GRACE_SEC):
+            # 직전까지 두 손이 가까웠는데 한 손만 보임 → 겹쳐서 한쪽을 잃은 것으로 보고 모임 유지
+            cx, cy = hand_centers[0]
+            mx, my = self._last_two_mid
+            if ((cx - mx) ** 2 + (cy - my) ** 2) ** 0.5 < HANDS_LOST_NEAR_DIST:
+                hands_together = True
+                cv.putText(frame_vis, "hands overlap (1 hand)", (10, 240),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         # [수정] 손목+4개 MCP 관절(0,5,9,13,17) 평균을 손 중심점으로 잡아 스와이프 감지
         swipe_up   = False
@@ -1027,6 +1051,7 @@ class CameraModule:
         main.py가 이미 지나간 제스처를 계속 True로 읽게 됨)
         """
         self._mode = mode
+        self._last_two_together = False  # 모드가 바뀌면 이전 양손 모임 기억은 버림
 
         if mode != "hand":
             # 마우스 버튼을 누른 채로 모드가 바뀌면 계속 눌린 상태로 고정되므로 놓아줌

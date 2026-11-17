@@ -12,6 +12,8 @@ import win32con
 import win32api  # [추가] 모니터 켜기용 마우스 이벤트
 
 CAMERA_WINDOW_TITLE = "AI Assistant - Camera"  # cameramodule.py의 imshow 창 제목
+POPUP_WINDOW_TITLE = "gesture-pc-assistant 확인"  # popup.py의 확인 팝업 제목 (닫기 대상에서 제외)
+_OWN_WINDOW_TITLES = (CAMERA_WINDOW_TITLE, POPUP_WINDOW_TITLE)
 
 # [추가] LLM이 해석한 "앱 열기" 명령용 화이트리스트 (임의 문자열 실행 방지 - 등록된 이름만 허용)
 ALLOWED_APPS = {
@@ -61,13 +63,35 @@ _last_minimized_hwnd = None  # swipe_up 복원을 위해 마지막으로 최소�
 
 
 def _get_target_window():
-    """현재 활성 창 핸들을 반환. 카메라 미리보기 창 자신은 제외."""
+    """현재 활성 창 핸들을 반환. 카메라 미리보기 창·확인 팝업 자신은 제외."""
     hwnd = win32gui.GetForegroundWindow()
     if not hwnd:
         return None
-    if win32gui.GetWindowText(hwnd) == CAMERA_WINDOW_TITLE:
+    if win32gui.GetWindowText(hwnd) in _OWN_WINDOW_TITLES:
         return None
     return hwnd
+
+
+# [추가] 창 닫기 확인용: 확인을 시작한 순간의 대상 창을 기억해 두었다가, "예"가 되면 그 창을 닫는다.
+# (확인 팝업이 떠 있는 동안 활성 창이 바뀌어도 엉뚱한 창이 닫히지 않게 함)
+def get_target_window():
+    return _get_target_window()
+
+
+def get_window_title(hwnd):
+    try:
+        return win32gui.GetWindowText(hwnd) if hwnd else ""
+    except Exception:
+        return ""
+
+
+def close_window(hwnd):
+    """지정한 창에 닫기 메시지 전달. 이미 없어졌거나 우리 앱 창이면 아무것도 하지 않음."""
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return
+    if win32gui.GetWindowText(hwnd) in _OWN_WINDOW_TITLES:
+        return
+    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
 
 
 def minimize_active_window():
