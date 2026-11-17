@@ -487,7 +487,9 @@ class PoseModule:
             pass
 
     # ── 외부(cameramodule)에서 매 프레임 호출 ────────────────
-    def process(self, frame_rgb, frame_vis):
+    def process(self, frame_rgb, frame_vis, landmark_canvas=None):
+        # landmark_canvas: 랜드마크 점·선을 그릴 실제 화면. 없으면 frame_vis에 그림 (기존 동작).
+        # 일반 모드에서는 frame_vis가 버려질 복사본이라, 점·선만 이쪽에 따로 그린다.
         res = self.pose.process(frame_rgb)
 
         detected       = False
@@ -509,7 +511,8 @@ class PoseModule:
 
             # 시각화 - 손 모드의 손 랜드마크 표시와 같은 방식
             mp_drawing.draw_landmarks(
-                frame_vis, res.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                landmark_canvas if landmark_canvas is not None else frame_vis,
+                res.pose_landmarks, mp_pose.POSE_CONNECTIONS,
                 mp_drawing.DrawingSpec(color=(0, 200, 255), thickness=2, circle_radius=3),
                 mp_drawing.DrawingSpec(color=(255, 140, 0), thickness=2),
             )

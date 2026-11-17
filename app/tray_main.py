@@ -53,9 +53,12 @@ try:
     import win32event
     import winerror
 
+    import cameramodule
     import commandmodule
     import main as assistant_main
+    import settings as app_settings
     from popup import ClosePopup
+    from settings_window import SettingsWindow
 except Exception:
     log("필요한 모듈을 불러오지 못했습니다:\n" + traceback.format_exc())
     raise
@@ -140,6 +143,49 @@ def on_ui_event(name, **d):
 
 
 assistant_main.set_ui_handler(on_ui_event)
+
+
+# ── 설정창 ──────────────────────────────────────────────────
+app_cfg = app_settings.load()   # 다음 실행에도 유지되는 설정 (app/settings.json)
+cameramodule.set_dev_overlay(app_cfg.get("dev_mode", False))   # 개발 모드: 저장된 값으로 시작
+
+
+def _set_dev(on):
+    cameramodule.set_dev_overlay(on)
+    app_cfg["dev_mode"] = bool(on)
+    if not app_settings.save(app_cfg):
+        log("설정을 저장하지 못했습니다 (settings.json)")
+    log(f"개발 모드 {'켜기' if on else '끄기'}")
+
+
+def _set_voice(on):
+    assistant.set_voice_enabled(on)
+    app_cfg["voice_enabled"] = bool(on)
+    if not app_settings.save(app_cfg):
+        log("설정을 저장하지 못했습니다 (settings.json)")
+    log(f"음성 명령 {'사용' if on else '사용 안 함'}")
+
+
+def _on_registered(ok, name, result):
+    if ok:
+        action = result.get("action") if isinstance(result, dict) else result
+        target = result.get("target") if isinstance(result, dict) else None
+        notify(f"{name}: {action}" + (f" · {target}" if target else ""), "명령 저장됨")
+    else:
+        notify(f"{name}: {result}", "명령을 저장하지 못했습니다")
+
+
+settings_window = SettingsWindow(
+    names=assistant_main.KNOWN_COMMAND_NAMES,
+    register_fn=assistant_main.register_named_command,
+    list_fn=commandmodule.list_commands,
+    delete_fn=commandmodule.delete_command,
+    get_voice=lambda: assistant.voice_enabled(),
+    set_voice=_set_voice,
+    on_registered=_on_registered,
+    get_dev=cameramodule.is_dev_overlay,
+    set_dev=_set_dev,
+)
 
 
 # ── 시작 시 안내 ────────────────────────────────────────────
@@ -231,7 +277,7 @@ def _quit(icon, item):
 
 menu = pystray.Menu(
     pystray.MenuItem("카메라 미리보기", _toggle_preview, checked=_preview_checked, enabled=_is_ready),
-    pystray.MenuItem("설정 (준비 중)", lambda icon, item: None, enabled=False),
+    pystray.MenuItem("설정", lambda icon, item: settings_window.show(), enabled=_is_ready),
     pystray.MenuItem("로그 보기", _open_log),
     pystray.MenuItem(_pause_text, _toggle_pause, enabled=_is_ready),
     pystray.Menu.SEPARATOR,
@@ -244,8 +290,9 @@ def _boot(icon):
     """모델 로딩(수십 초 걸릴 수 있음)을 트레이 아이콘이 뜬 뒤에 별도 스레드로 처리"""
     try:
         assistant.start()
+        assistant.set_voice_enabled(app_cfg.get("voice_enabled", True))  # 저장된 설정 반영
         state["phase"] = "running"
-        log("비서 시작 완료")
+        log("비서 시작 완료" + ("" if app_cfg.get("voice_enabled", True) else " (음성 명령 사용 안 함)"))
     except Exception:
         state["phase"] = "error"
         log("비서를 시작하지 못했습니다:\n" + traceback.format_exc())

@@ -16,7 +16,7 @@ import time
 import threading
 from PIL import ImageGrab  # [추가] ㅡ자 자세로 화면 캡처
 
-from cameramodule import CameraModule, PINCH_SLOTS
+from cameramodule import CameraModule, PINCH_SLOTS, set_dev_overlay
 from posemodule import PoseModule  # [추가] 전신 포즈 인식 (포즈 모드)
 from audiomodule import AudioModule
 from voicemodule import VoiceModule  # [추가] 웨이크워드 감지 (음성 명령의 첫 단계)
@@ -465,7 +465,7 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event, answ
             if wake_word_edge:
                 _log("음성", f"웨이크워드 감지 (\"{voice_res['last_text']}\") - 명령 녹음 시작")
                 _emit("voice_listening")
-            if voice_trigger_edge and not recording_manual and not voice_res["recording"]:
+            if voice_trigger_edge and voice.enabled and not recording_manual and not voice_res["recording"]:
                 # voice_res["recording"] 체크: 웨이크워드로 이미 녹음 중이면 겹쳐서
                 # 시작하지 않음 (진행 중이던 vad 녹음 버퍼가 지워지는 것 방지)
                 voice.start_command_recording(mode="manual")
@@ -574,6 +574,15 @@ class Assistant:
     def is_paused(self):
         return self._pause_event.is_set()
 
+    # ── 음성 기능 켜기/끄기 (설정창) ───────────────────────
+    def set_voice_enabled(self, on):
+        """끄면 웨이크워드 감지와 손등 3초 음성 트리거가 모두 동작하지 않음"""
+        if self.voice is not None:
+            self.voice.enabled = bool(on)
+
+    def voice_enabled(self):
+        return self.voice.enabled if self.voice is not None else True
+
     # ── 카메라 미리보기 ────────────────────────────────────
     def set_preview(self, on):
         self.show_window = bool(on)
@@ -597,6 +606,7 @@ class Assistant:
 
 # [수정] 예전 run_assistant(): 콘솔 실행용. 동작은 이전과 같다 (콘솔 로그, 카메라 창, 콘솔 명령 등록).
 def run_assistant():
+    set_dev_overlay(True)  # 콘솔 실행은 개발용이라 예전처럼 지표를 전부 표시
     assistant = Assistant(show_window=True)
     assistant.start()
     threading.Thread(target=_console_register_loop, daemon=True).start()

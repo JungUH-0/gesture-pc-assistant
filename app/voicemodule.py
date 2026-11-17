@@ -50,6 +50,7 @@ class VoiceModule:
         self.device  = device
         self.running = False
         self.paused  = False  # [추가] True면 웨이크워드 검사를 건너뜀 (트레이의 일시정지)
+        self.enabled = True   # [추가] False면 음성 기능 자체를 끔 (설정창의 음성 켜기/끄기, 일시정지와 별개)
 
         # [추가] 웨이크워드 검사용 - 최근 CHUNK_SEC초 분량을 담아두는 링 버퍼
         self._buffer = np.zeros(BUFFER_SAMPLES, dtype=np.float32)
@@ -151,8 +152,8 @@ class VoiceModule:
             while self.running:
                 time.sleep(CHECK_INTERVAL_SEC)
 
-                if self.paused:
-                    continue  # 일시정지 중에는 웨이크워드 검사(GPU 사용)를 하지 않음
+                if self.paused or not self.enabled:
+                    continue  # 일시정지·음성 끔 상태에서는 웨이크워드 검사(GPU 사용)를 하지 않음
 
                 # [추가] 녹음 중이면: 안전 시간 초과 체크 + (vad 모드일 때만) 무음 자동 종료
                 if self._recording:

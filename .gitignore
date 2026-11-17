@@ -7,9 +7,10 @@ commands.json
 # 화면 캡처 결과 (ㅡ자 자세)
 captures/
 
-# 트레이 앱 로그와 첫 실행 표시
+# 트레이 앱 로그·첫 실행 표시·개인 설정
 logs/
 .first_run_done
+settings.json
 
 # 문서: docs에서는 md(와 md가 쓰는 이미지)만 올리고, 변환본(Word·PPT)은 올리지 않음
 docs/**/*.docx

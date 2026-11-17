@@ -147,6 +147,22 @@ def _save_commands(commands):
         json.dump(commands, f, ensure_ascii=False, indent=2)
 
 
+# [추가] 설정창에서 쓰는 목록 조회 / 삭제
+def list_commands():
+    """등록된 명령 전체 {이름: {action, target}} (파일이 없거나 깨져 있으면 빈 dict)"""
+    return _load_commands()
+
+
+def delete_command(gesture_name):
+    """등록된 명령을 지움. 지웠으면 True, 원래 없었으면 False."""
+    commands = _load_commands()
+    if gesture_name not in commands:
+        return False
+    del commands[gesture_name]
+    _save_commands(commands)
+    return True
+
+
 def _check_target(action, target):
     """
     action에 필요한 target을 검증. 문제가 없으면 None, 있으면 에러 메시지를 반환.

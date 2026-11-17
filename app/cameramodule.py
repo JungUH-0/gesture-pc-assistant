@@ -29,12 +29,31 @@ def _get_korean_font(size):
     return _korean_font_cache[size]
 
 
+# [추가] 개발 모드 스위치. 꺼져 있으면(일반 모드) 화면에는 손·몸 랜드마크 점과 연결선만 그리고,
+# FPS·모드·판정 수치·박스·진행률 같은 지표는 그리지 않는다. 켜면(개발 모드) 전부 그린다.
+# 지표를 그리는 코드는 그대로 두고, 일반 모드에서는 "버려지는 복사본 화면"에 그리게 해서
+# 그리기 지점 수십 곳을 하나씩 고치지 않는다 (run() 참고).
+_dev_overlay = False
+
+
+def set_dev_overlay(on):
+    global _dev_overlay
+    _dev_overlay = bool(on)
+
+
+def is_dev_overlay():
+    return _dev_overlay
+
+
 def put_korean_text(frame, text, org, font_size=24, color=(255, 200, 0)):
     """
     OpenCV 프레임(BGR numpy 배열)에 한글 텍스트를 그림 (cv.putText처럼 frame을 제자리에서 수정).
     PIL로 그린 뒤 다시 numpy로 변환하는 방식이라 매 프레임 호출하면 약간의 비용이 있지만,
     텍스트 몇 줄 정도는 실시간 표시에 문제 없는 수준.
+    [추가] 한글 텍스트는 전부 개발용 지표라, 일반 모드에서는 비용이 큰 변환을 건너뛴다.
     """
+    if not _dev_overlay:
+        return
     img_pil = Image.fromarray(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
     # color는 OpenCV(BGR) 관례를 그대로 받되, PIL은 RGB라서 순서를 뒤집어줌
@@ -334,6 +353,10 @@ class CameraModule:
         # 넘겨주는 방식으로 공유한다.
         self.pose_module = pose_module
 
+        # [추가] 랜드마크 점·선을 그릴 실제 화면. 지표(frame_vis)는 일반 모드에서 버려질 복사본일 수 있어서
+        # 점·선만 항상 여기에 그린다 (run()이 매 프레임 지정)
+        self._lm_canvas = None
+
         # [추가] 양손 모임이 한 손 소실로 끊기지 않게 하는 상태 (HANDS_LOST_* 참고)
         self._last_two_time     = 0.0    # 마지막으로 양손이 둘 다 검출된 시각
         self._last_two_mid      = None   # 그때 두 손 중심점의 중점
@@ -500,9 +523,10 @@ class CameraModule:
                     float(np.mean([hand_lm.landmark[j].y for j in HAND_CENTER_INDICES])),
                 ))
 
-                # 시각화
+                # 시각화 (랜드마크 점·선은 일반 모드에서도 항상 실제 화면에 그림)
                 mp_drawing.draw_landmarks(
-                    frame_vis, hand_lm, mp_hands.HAND_CONNECTIONS,
+                    self._lm_canvas if self._lm_canvas is not None else frame_vis,
+                    hand_lm, mp_hands.HAND_CONNECTIONS,
                     mp_drawing.DrawingSpec(color=(0,200,255), thickness=2, circle_radius=3),
                     mp_drawing.DrawingSpec(color=(0,255,100), thickness=2),
                 )
@@ -982,34 +1006,42 @@ class CameraModule:
             frame = cv.flip(frame, 1)
             frame_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
 
+            # [추가] 개발 모드면 지표를 실제 화면에 그리고, 일반 모드면 버려질 복사본에 그린다.
+            # 랜드마크 점·선은 어느 모드에서든 실제 화면(frame)에 그린다.
+            dev = _dev_overlay
+            vis = frame if dev else frame.copy()
+            self._lm_canvas = frame
+
             # [수정] 모드에 따라 인식기 하나만 실행 - 동시에 돌리면 FPS가 떨어짐
             if self._mode == "hand":
                 # 손동작 처리
-                self._process_hands(frame_rgb, frame)
+                self._process_hands(frame_rgb, vis)
 
                 # 눈 깜빡임 처리 - [수정] 눈 기능이 꺼져 있으면 얼굴 인식을 돌리지 않는다
                 if EYE_TRACKING_ENABLED:
-                    self._process_blink(frame_rgb, frame)
+                    self._process_blink(frame_rgb, vis)
             elif self._mode == "pose" and self.pose_module is not None:
                 # 전신 포즈 처리 (카메라를 공유하기 위해 프레임을 넘겨줌)
-                self.pose_module.process(frame_rgb, frame)
+                self.pose_module.process(frame_rgb, vis, landmark_canvas=frame)
             # [추가] 그 밖의 모드("off" = 일시정지)에서는 어떤 인식도 하지 않고 프레임만 읽음
 
-            # FPS 계산 및 표시
+            # FPS 계산 (결과값은 항상 갱신, 화면 표시는 개발 모드에서만)
             curr_time = time.time()
             fps = 1 / max(curr_time - prev_time, 1e-6)
             prev_time = curr_time
             with self._lock:
                 self.result["fps"] = fps
-            cv.putText(frame, f"FPS:{fps:.1f}", (10, 30),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,100), 2)
 
-            # [추가] 지금 어떤 모드인지 항상 화면에 표시 (모드를 모르면 왜 반응이
-            # 없는지 알 수 없어서 혼란스러움)
-            mode_label = {"hand": "손동작 모드", "pose": "전신 포즈 모드"}.get(self._mode, "일시정지")
-            mode_color = {"hand": (0, 255, 100), "pose": (255, 140, 0)}.get(self._mode, (160, 160, 160))
-            put_korean_text(frame, mode_label, (frame.shape[1] - 200, 8),
-                            font_size=26, color=mode_color)
+            if dev:
+                cv.putText(frame, f"FPS:{fps:.1f}", (10, 30),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,100), 2)
+
+                # [추가] 지금 어떤 모드인지 화면에 표시 (모드를 모르면 왜 반응이
+                # 없는지 알 수 없어서 혼란스러움)
+                mode_label = {"hand": "손동작 모드", "pose": "전신 포즈 모드"}.get(self._mode, "일시정지")
+                mode_color = {"hand": (0, 255, 100), "pose": (255, 140, 0)}.get(self._mode, (160, 160, 160))
+                put_korean_text(frame, mode_label, (frame.shape[1] - 200, 8),
+                                font_size=26, color=mode_color)
 
             if self.show_window:
                 cv.imshow(window_name, frame)
