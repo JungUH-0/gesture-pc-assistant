@@ -26,6 +26,7 @@ ALLOWED_ACTIONS = {
     "restore_window": [],
     "turn_off_monitor": [],
     "turn_on_monitor": [],
+    "capture_screen": [],           # [추가] 화면 캡처 (captures 폴더에 PNG 저장)
     "open_app": ["target"],
     "press_shortcut": ["target"],   # [추가] 키보드 단축키 입력
     "press_media_key": ["target"],  # [추가] 볼륨/재생 등 미디어 키 입력
@@ -75,6 +76,9 @@ SYSTEM_PROMPT = f"""너는 사용자의 자연어 명령을 아래 JSON 스키�
 
 사용자 명령: 화면 꺼줘
 {{"action": "turn_off_monitor", "target": null}}
+
+사용자 명령: 화면 캡처해줘
+{{"action": "capture_screen", "target": null}}
 
 사용자 명령: 유튜브 켜줘
 {{"action": "open_url", "target": "youtube"}}
@@ -215,6 +219,9 @@ def _run_action(action, target):
         windowcontrol.turn_off_monitor()
     elif action == "turn_on_monitor":
         windowcontrol.turn_on_monitor()
+    elif action == "capture_screen":
+        ok, info = windowcontrol.capture_screen()
+        return ok, (None if ok else info)
     elif action == "open_app":
         return windowcontrol.open_app(target)
     elif action == "press_shortcut":

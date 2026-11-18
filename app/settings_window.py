@@ -39,10 +39,22 @@ class SettingsWindow:
     """
 
     def __init__(self, names, register_fn, list_fn, delete_fn, get_voice, set_voice,
-                 on_registered=None, get_dev=None, set_dev=None):
+                 on_registered=None, get_dev=None, set_dev=None, pose_api=None,
+                 get_whisper=None, set_whisper=None, whisper_active=None):
+        # get_whisper/set_whisper: 음성 인식 실행 방식 "auto"|"gpu"|"cpu" 읽기/저장 (없으면 선택 상자를 만들지 않음)
+        # whisper_active: () -> 지금 실제로 적용 중인 방식 "gpu"|"cpu" (안내 문구용, 선택)
+        self.get_whisper = get_whisper
+        self.set_whisper = set_whisper
+        self.whisper_active = whisper_active
         self.get_dev = get_dev
         self.set_dev = set_dev
-        self.names = list(names)
+        # names: 목록 또는 목록을 돌려주는 함수. 함수면 포즈를 등록·삭제할 때마다 다시 불러 동작 이름 목록을 갱신한다
+        self._names_source = names
+        # pose_api: 포즈 탭이 쓰는 함수 모음 (없으면 포즈 탭을 만들지 않음)
+        #   "list"    () -> (행 목록, 메타)   행: {name, kind("기본 제공"|"사용자"), command}, 메타: {builtin, count, max}
+        #   "capture" (이름, on_status) -> (성공 여부, 안내 문구)   수 초 걸리므로 별도 스레드에서 호출됨
+        #   "delete"  (이름) -> 안내 문구      "restore" () -> (성공 여부, 안내 문구)
+        self.pose_api = pose_api
         self.register_fn = register_fn
         self.list_fn = list_fn
         self.delete_fn = delete_fn
@@ -53,6 +65,10 @@ class SettingsWindow:
         self._thread = None
         self._raise_flag = threading.Event()
         self._results = queue.Queue()
+
+    def _get_names(self):
+        src = self._names_source
+        return list(src() if callable(src) else src)
 
     def is_open(self):
         return self._thread is not None and self._thread.is_alive()
@@ -100,8 +116,9 @@ class SettingsWindow:
         ttk.Label(form, text="동작 이름", font=FONT).grid(row=0, column=0, sticky="w")
         ttk.Label(form, text="하고 싶은 일", font=FONT).grid(row=0, column=1, sticky="w", padx=(14, 0))
 
-        name_var = tk.StringVar(value=self.names[0] if self.names else "")
-        name_box = ttk.Combobox(form, textvariable=name_var, values=self.names, state="readonly",
+        initial_names = self._get_names()
+        name_var = tk.StringVar(value=initial_names[0] if initial_names else "")
+        name_box = ttk.Combobox(form, textvariable=name_var, values=initial_names, state="readonly",
                                 width=18, font=FONT)
         name_box.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
@@ -157,7 +174,7 @@ class SettingsWindow:
 
         def on_tree_select(_event=None):
             selected = tree.selection()
-            if selected and selected[0] in self.names:
+            if selected and selected[0] in self._get_names():
                 name_var.set(selected[0])
 
         tree.bind("<<TreeviewSelect>>", on_tree_select)
@@ -184,7 +201,7 @@ class SettingsWindow:
                         self.on_registered(ok, name, result)
                     except Exception:
                         pass
-                self._results.put((ok, name, result))
+                self._results.put(("reg", ok, name, result))
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -209,6 +226,147 @@ class SettingsWindow:
 
         delete_btn.config(command=do_delete)
 
+        def refresh_names():
+            """포즈를 등록·삭제하면 명령 등록 탭의 동작 이름 목록(pose_이름)도 새로 불러온다"""
+            names = self._get_names()
+            name_box.config(values=names)
+            if name_var.get() not in names:
+                name_var.set(names[0] if names else "")
+
+        # ── 포즈 탭 ─────────────────────────────────────────
+        refresh_pose_list = None
+        if self.pose_api is not None:
+            tab_pose = ttk.Frame(notebook, padding=14)
+            notebook.add(tab_pose, text="포즈")
+
+            pform = ttk.Frame(tab_pose)
+            pform.pack(fill="x")
+            pform.columnconfigure(0, weight=1)
+            ttk.Label(pform, text="새 포즈 이름", font=FONT).grid(row=0, column=0, sticky="w")
+            pose_name_var = tk.StringVar()
+            pose_entry = ttk.Entry(pform, textvariable=pose_name_var, font=FONT)
+            pose_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(2, 0), ipady=3)
+            capture_btn = ttk.Button(pform, text="촬영")
+            capture_btn.grid(row=1, column=1, pady=(2, 0))
+
+            pose_status_var = tk.StringVar(
+                value="이름을 입력하고 촬영을 누르세요. 상체와 양팔이 카메라에 보이게 앉아 자세를 취하면 됩니다. "
+                      "명령은 나중에 '명령 등록' 탭에서 연결할 수 있습니다.")
+            pose_status = tk.Label(tab_pose, textvariable=pose_status_var, anchor="w", justify="left", font=FONT,
+                                   bg="#F2F2F2", fg="#444444", padx=10, pady=7, wraplength=680)
+            pose_status.pack(fill="x", pady=(12, 0))
+
+            pose_count_var = tk.StringVar(value="등록된 포즈")
+            ttk.Label(tab_pose, textvariable=pose_count_var, font=FONT_BOLD).pack(anchor="w", pady=(16, 4))
+
+            pframe = ttk.Frame(tab_pose)
+            pframe.pack(fill="both", expand=True)
+            ptree = ttk.Treeview(pframe, columns=("name", "kind", "cmd"), show="headings", selectmode="browse")
+            ptree.heading("name", text="포즈 이름")
+            ptree.heading("kind", text="종류")
+            ptree.heading("cmd", text="연결된 명령")
+            ptree.column("name", width=190, anchor="w")
+            ptree.column("kind", width=90, anchor="w")
+            ptree.column("cmd", width=360, anchor="w")
+            pscroll = ttk.Scrollbar(pframe, orient="vertical", command=ptree.yview)
+            ptree.configure(yscrollcommand=pscroll.set)
+            ptree.pack(side="left", fill="both", expand=True)
+            pscroll.pack(side="right", fill="y")
+
+            pbottom = ttk.Frame(tab_pose)
+            pbottom.pack(fill="x", pady=(8, 0))
+            pose_delete_btn = ttk.Button(pbottom, text="선택한 포즈 삭제")
+            pose_delete_btn.pack(side="right")
+            restore_btn = ttk.Button(pbottom, text="기본 자세(ㅡ자) 복원")
+            restore_btn.pack(side="right", padx=(0, 8))
+            ttk.Label(pbottom, font=("Malgun Gothic", 9), foreground="#777777",
+                      text="포즈는 정지 자세만 등록할 수 있습니다. 포즈 모드에서 인식됩니다.").pack(side="left")
+
+            def set_pose_status(text, kind="info"):
+                colors = {"info": ("#F2F2F2", "#444444"), "ok": ("#E8F5E9", "#2E5E3A"),
+                          "error": ("#FBE9E7", "#B03A2E"), "busy": ("#FFF8E1", "#7A5B00")}
+                bg, fg = colors[kind]
+                pose_status.config(bg=bg, fg=fg)
+                pose_status_var.set(text)
+
+            def refresh_pose_list():
+                ptree.delete(*ptree.get_children())
+                try:
+                    rows, meta = self.pose_api["list"]()
+                except Exception as e:
+                    set_pose_status(f"포즈 목록을 읽지 못했습니다: {e}", "error")
+                    return
+                for row in rows:
+                    ptree.insert("", "end", iid=row["name"],
+                                 values=(row["name"], row["kind"], row["command"]))
+                pose_count_var.set(f"등록된 포즈 ({meta['count']} / {meta['max']})")
+                restore_btn.state(["!disabled"] if not meta["builtin"] else ["disabled"])
+                refresh_names()
+
+            def do_capture(_event=None):
+                name = pose_name_var.get().strip()
+                if not name:
+                    set_pose_status("포즈 이름을 입력하세요.", "error")
+                    return
+                capture_btn.state(["disabled"])
+                set_pose_status("준비 중입니다...", "busy")
+
+                def worker():
+                    try:
+                        ok, msg = self.pose_api["capture"](
+                            name, lambda text: self._results.put(("pose_status", text)))
+                    except Exception as e:
+                        ok, msg = False, f"촬영 중 오류가 났습니다: {e}"
+                    self._results.put(("pose_done", ok, msg))
+
+                threading.Thread(target=worker, daemon=True).start()
+
+            capture_btn.config(command=do_capture)
+            pose_entry.bind("<Return>", do_capture)
+
+            def do_pose_delete():
+                selected = ptree.selection()
+                if not selected:
+                    set_pose_status("삭제할 포즈를 목록에서 선택하세요.", "error")
+                    return
+                name = selected[0]
+                builtin = next((r["kind"] == "기본 제공" for r in self.pose_api["list"]()[0] if r["name"] == name), False)
+                if builtin:
+                    question = (f"'{name}'은 기본 제공 자세입니다.\n삭제하면 이 자세로 화면을 캡처하는 기능이 꺼집니다.\n"
+                                "(나중에 '기본 자세 복원'으로 되돌릴 수 있습니다)\n\n삭제할까요?")
+                else:
+                    question = f"'{name}' 포즈를 삭제할까요?\n연결해 둔 명령도 함께 삭제됩니다."
+                if not messagebox.askyesno("포즈 삭제", question, parent=root):
+                    return
+                try:
+                    msg = self.pose_api["delete"](name)
+                except Exception as e:
+                    set_pose_status(f"삭제하지 못했습니다: {e}", "error")
+                    return
+                refresh_pose_list()
+                refresh_list()   # 연결된 명령이 함께 지워졌을 수 있어 명령 목록도 새로 고침
+                set_pose_status(msg, "ok")
+
+            pose_delete_btn.config(command=do_pose_delete)
+
+            def do_restore():
+                try:
+                    ok, msg = self.pose_api["restore"]()
+                except Exception as e:
+                    ok, msg = False, str(e)
+                refresh_pose_list()
+                set_pose_status(msg, "ok" if ok else "error")
+
+            restore_btn.config(command=do_restore)
+            refresh_pose_list()
+
+        def on_tab_changed(_event=None):
+            refresh_names()   # 다른 탭에서 바뀐 포즈 이름을 명령 등록 탭에 반영
+            if refresh_pose_list:
+                refresh_pose_list()
+
+        notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
+
         # ── 음성 탭 ─────────────────────────────────────────
         tab_voice = ttk.Frame(notebook, padding=18)
         notebook.add(tab_voice, text="음성")
@@ -226,6 +384,36 @@ class SettingsWindow:
         voice_note.pack(anchor="w", pady=(6, 0))
         ttk.Label(tab_voice, font=("Malgun Gothic", 9), foreground="#777777",
                   text="끄면 웨이크워드 감지(GPU 사용)와 손등 3초 음성 트리거가 모두 멈춥니다.").pack(anchor="w", pady=(2, 0))
+
+        # 음성 인식 실행 방식 (GPU 없는 PC에서는 CPU 방식 선택). 모델은 시작할 때 한 번만 불러오므로 다음 실행부터 적용
+        if self.get_whisper is not None and self.set_whisper is not None:
+            WHISPER_LABELS = {
+                "auto": "자동 (GPU가 있으면 GPU, 없으면 CPU)",
+                "gpu":  "GPU (medium, 소음에 강함, NVIDIA GPU 필요)",
+                "cpu":  "CPU (small, GPU 없이 동작, 느림)",
+            }
+            label_to_mode = {v: k for k, v in WHISPER_LABELS.items()}
+
+            ttk.Separator(tab_voice).pack(fill="x", pady=(14, 10))
+            ttk.Label(tab_voice, text="음성 인식 실행 방식").pack(anchor="w")
+            cur = self.get_whisper()
+            whisper_var = tk.StringVar(value=WHISPER_LABELS.get(cur, WHISPER_LABELS["auto"]))
+            whisper_box = ttk.Combobox(tab_voice, textvariable=whisper_var, state="readonly",
+                                       values=list(WHISPER_LABELS.values()), width=44)
+            whisper_box.pack(anchor="w", pady=(4, 0))
+
+            active = self.whisper_active() if self.whisper_active else None
+            active_text = f"현재 적용 중: {'GPU' if active == 'gpu' else 'CPU'}" if active else ""
+            whisper_note = ttk.Label(tab_voice, font=("Malgun Gothic", 9), foreground="#777777",
+                                     text=(active_text + (" · " if active_text else "") + "바꾸면 앱을 다시 실행한 뒤 적용됩니다."))
+            whisper_note.pack(anchor="w", pady=(6, 0))
+
+            def on_whisper_change(_event=None):
+                mode = label_to_mode.get(whisper_var.get(), "auto")
+                self.set_whisper(mode)
+                whisper_note.config(text="저장했습니다. 앱을 다시 실행하면 적용됩니다.")
+
+            whisper_box.bind("<<ComboboxSelected>>", on_whisper_change)
 
         # ── 일반 탭 (지금은 개발 모드만. 캡처 폴더·자동 실행 등은 필요해질 때 추가) ──
         if self.get_dev is not None and self.set_dev is not None:
@@ -255,16 +443,28 @@ class SettingsWindow:
         def poll():
             while True:
                 try:
-                    ok, name, result = self._results.get_nowait()
+                    item = self._results.get_nowait()
                 except queue.Empty:
                     break
-                save_btn.state(["!disabled"])
-                if ok:
-                    set_status(f"저장됨 → {name} : {_format_command(result)}", "ok")
-                    text_var.set("")
-                    refresh_list()
-                else:
-                    set_status(f"저장하지 못했습니다: {result}", "error")
+                kind = item[0]
+                if kind == "reg":                      # 명령 저장 결과
+                    _, ok, name, result = item
+                    save_btn.state(["!disabled"])
+                    if ok:
+                        set_status(f"저장됨 → {name} : {_format_command(result)}", "ok")
+                        text_var.set("")
+                        refresh_list()
+                    else:
+                        set_status(f"저장하지 못했습니다: {result}", "error")
+                elif kind == "pose_status" and refresh_pose_list:   # 촬영 진행 안내 (카운트다운 등)
+                    set_pose_status(item[1], "busy")
+                elif kind == "pose_done" and refresh_pose_list:     # 촬영·등록 결과
+                    _, ok, msg = item
+                    capture_btn.state(["!disabled"])
+                    if ok:
+                        pose_name_var.set("")
+                    refresh_pose_list()
+                    set_pose_status(msg, "ok" if ok else "error")
             if self._raise_flag.is_set():
                 self._raise_flag.clear()
                 root.deiconify()

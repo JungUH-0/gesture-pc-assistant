@@ -14,7 +14,6 @@ import os
 import queue
 import time
 import threading
-from PIL import ImageGrab  # [추가] ㅡ자 자세로 화면 캡처
 
 from cameramodule import CameraModule, PINCH_SLOTS, set_dev_overlay
 from posemodule import PoseModule  # [추가] 전신 포즈 인식 (포즈 모드)
@@ -22,6 +21,7 @@ from audiomodule import AudioModule
 from voicemodule import VoiceModule  # [추가] 웨이크워드 감지 (음성 명령의 첫 단계)
 import windowcontrol
 import commandmodule  # [추가] LLM으로 등록한 사용자 정의 명령 실행용
+import posestore      # [추가] 사용자가 등록한 자세 (이름 목록을 명령 이름에 포함)
 
 # [추가] 커스텀 명령 슬롯 이름 목록 (엄지+중지/약지/새끼) - cameramodule의 정의를 그대로 사용
 PINCH_SLOT_NAMES = [name for name, _ in PINCH_SLOTS]
@@ -81,13 +81,14 @@ def set_ui_handler(fn):
     _ui_handler = fn
 
 
-def _emit(name, **data):
+def _emit(event, /, **data):
+    # event는 위치 전용: 데이터 키로 name 같은 이름을 써도 충돌하지 않게 한다
     if _ui_handler is None:
         return
     try:
-        _ui_handler(name, **data)
+        _ui_handler(event, **data)
     except Exception as e:  # UI 쪽 오류가 비서 루프를 죽이지 않게
-        _log("시스템", f"UI 이벤트 처리 오류 ({name}): {e}")
+        _log("시스템", f"UI 이벤트 처리 오류 ({event}): {e}")
 
 
 # [추가] 콘솔에 시각 태그를 붙여 어느 시점에 무슨 신호가 찍혔는지 구분하기 쉽게 함
@@ -124,6 +125,15 @@ def _run_voice_command(text):
 KNOWN_COMMAND_NAMES = ["swipe_up", "swipe_down", "close_confirm", "away", "back", "nod", "shake"] + PINCH_SLOT_NAMES
 
 
+def command_names():
+    """등록할 수 있는 명령 이름 전체: 고정 이름 + 사용자가 등록한 자세(`pose_이름`)"""
+    return KNOWN_COMMAND_NAMES + [f"pose_{n}" for n in posestore.user_pose_names()]
+
+
+# 화면 캡처가 저장되면(ㅡ자 자세든, 자세에 연결한 "화면 캡처" 명령이든) 알림 이벤트를 보낸다
+windowcontrol.set_capture_listener(lambda path: _emit("capture_saved", path=path))
+
+
 # [추가] 명령 등록 - 콘솔 입력과 (앞으로의) 설정창이 함께 쓰는 등록 함수.
 # LLM 호출이 최대 60초 걸릴 수 있으므로 호출하는 쪽에서 별도 스레드로 돌려야 한다.
 # 반환: (성공 여부, 결과 또는 오류 내용)
@@ -132,7 +142,7 @@ def register_named_command(name, text):
     if not name or not text:
         _log("등록", "형식 오류 - 이름과 내용을 모두 입력")
         return False, "이름과 내용을 모두 입력"
-    if name not in KNOWN_COMMAND_NAMES:
+    if name not in command_names():
         _log("등록", f"주의: '{name}'은 main이 호출하는 이름이 아니라 저장만 되고 실행되지 않음")
     try:
         ok, result = commandmodule.register_command(name, text)
@@ -148,7 +158,7 @@ def register_named_command(name, text):
 # [수정] Assistant와 분리: 콘솔 실행(run_assistant)에서만 시작한다.
 def _console_register_loop():
     print("[등록] 명령 저장: '이름: 하고 싶은 일' 형식으로 입력 (예: pinch_ring: 크롬 열어줘)")
-    print(f"[등록] main이 쓰는 이름: {', '.join(KNOWN_COMMAND_NAMES)}")
+    print(f"[등록] main이 쓰는 이름: {', '.join(command_names())}")
     while True:
         try:
             line = input().strip()
@@ -166,7 +176,9 @@ def _console_register_loop():
 # [수정] 예전 run_assistant()의 이벤트 루프 본문. 모듈 생성·스레드 시작은 Assistant.start()가 하고,
 # 이 함수는 만들어진 모듈을 받아서 신호를 처리한다. (본문은 들여쓰기·동작 모두 그대로)
 # stop_event가 켜지거나 카메라 스레드가 끝나면(카메라 창에서 'q') 루프를 마치고 정리한다.
-def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event, answer_queue):
+def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event, answer_queue,
+              mode_queue, shared):
+    # mode_queue: 설정창의 포즈 촬영이 요청하는 모드 전환 / shared["mode"]: 지금 모드를 밖에서 읽기 위한 공유값
     global _quiet_logs
     no_hand_since = None  # 손이 안 보이기 시작한 시각 (None이면 보이는 중)
 
@@ -176,6 +188,7 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event, answ
 
     # [추가] 인식 모드 상태 - 시작은 손동작 모드
     mode = MODE_HAND
+    shared["mode"] = mode
     last_mode_switch_time = 0.0
     last_hands_together_time = 0.0   # [추가] 양손이 마지막으로 모여 있던 시각 (박수 방식용)
     hands_together_start     = None  # [추가] 양손을 모으기 시작한 시각 (유지시간 판정용)
@@ -204,6 +217,7 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event, answ
     prev_nod = False
     prev_t_pose = False
     prev_shake = False
+    prev_pose_event = None   # [추가] 사용자 등록 자세 이벤트 rising edge용
 
     # [추가] 음성 명령 트리거(웨이크워드 / 손등 3초) rising edge용 이전 상태 기억
     prev_wake_word     = False
@@ -244,6 +258,21 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event, answ
                 _log("시스템", "재개")
 
             now = time.time()
+
+            # [추가] 설정창의 포즈 촬영이 요청한 모드 전환 (촬영은 포즈 모드에서만 가능).
+            # 사용자가 직접 전환한 것이 아니므로 알림은 보내지 않고, 곧바로 다시 전환되지 않도록 잠금을 건다.
+            try:
+                requested = mode_queue.get_nowait()
+            except queue.Empty:
+                requested = None
+            if requested and requested != mode:
+                mode = requested
+                last_mode_switch_time = now
+                hands_together_start  = None
+                mode_switch_armed     = False
+                cam.set_mode(mode)
+                shared["mode"] = mode
+                _log("모드", f"설정창 요청으로 {'전신 포즈' if mode == MODE_POSE else '손동작'} 모드로 전환")
 
             # [추가] 손 모드에서 손이 안 보인 지 HAND_GONE_QUIET_SEC가 지나면 손 로그를 끔
             # (포즈 모드는 손 추적이 꺼져 있어 항상 "안 보임"이므로 대상에서 제외)
@@ -288,6 +317,7 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event, answ
                 hands_together_start  = None
                 mode_switch_armed     = False
                 cam.set_mode(mode)
+                shared["mode"] = mode
                 _log("모드", f"{'전신 포즈' if mode == MODE_POSE else '손동작'} 모드로 전환")
                 _emit("mode_changed", mode=mode)
 
@@ -447,15 +477,22 @@ def _run_loop(cam, pose, audio, voice, cam_thread, stop_event, pause_event, answ
             t_pose_edge = pose_res["t_pose"] and not prev_t_pose
             prev_t_pose = pose_res["t_pose"]
             if t_pose_edge:
-                try:
-                    os.makedirs("captures", exist_ok=True)
-                    path = os.path.join("captures", time.strftime("capture_%Y%m%d_%H%M%S.png"))
-                    ImageGrab.grab().save(path)
-                    _log("포즈", f"ㅡ자 자세 - 화면 캡처 저장: {path}")
-                    _emit("capture_saved", path=os.path.abspath(path))
-                except Exception as e:
-                    _log("포즈", f"화면 캡처 실패: {e}")
-                    _emit("capture_failed", error=str(e))
+                ok, info = windowcontrol.capture_screen()   # 성공 알림은 capture_listener가 보냄
+                if ok:
+                    _log("포즈", f"ㅡ자 자세 - 화면 캡처 저장: {info}")
+                else:
+                    _log("포즈", info)
+                    _emit("capture_failed", error=info)
+
+            # [추가] 사용자가 등록한 자세 → `pose_이름` 명령 실행. 명령을 연결하지 않았어도 자세는 인식되므로
+            # 알림으로 인식 여부를 알려 준다 (명령은 나중에 명령 등록 탭에서 연결할 수 있음).
+            # 창 닫기 확인 중에는 실행하지 않는다.
+            pose_evt = pose_res.get("pose_event")
+            if pose_evt and pose_evt != prev_pose_event and not pending_close:
+                ok, _ = commandmodule.execute_command("pose_" + pose_evt)
+                _log("포즈", f"자세 '{pose_evt}' 인식 ({'사용자 정의 명령 실행' if ok else '등록된 명령 없음'})")
+                _emit("pose_recognized", pose=pose_evt, executed=bool(ok))
+            prev_pose_event = pose_evt
 
             # [수정] 음성 명령 트리거 처리
             # - 웨이크워드: VoiceModule이 스스로 녹음을 시작하고 무음 감지로 알아서
@@ -525,6 +562,8 @@ class Assistant:
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._answer_queue = queue.Queue()   # 확인 팝업 버튼 응답 (True=예, False=아니오)
+        self._mode_queue = queue.Queue()     # 설정창 포즈 촬영이 요청하는 모드 전환
+        self._shared = {"mode": MODE_HAND}   # 이벤트 루프의 현재 모드를 밖에서 읽기 위한 공유값
 
     def start(self):
         """모듈을 만들고(Whisper 로딩으로 수십 초 걸릴 수 있음) 스레드를 시작한다."""
@@ -547,13 +586,61 @@ class Assistant:
         self._loop_thread = threading.Thread(
             target=_run_loop,
             args=(self.cam, self.pose, self.audio, self.voice, cam_thread,
-                  self._stop_event, self._pause_event, self._answer_queue),
+                  self._stop_event, self._pause_event, self._answer_queue,
+                  self._mode_queue, self._shared),
             daemon=True,
         )
         self._loop_thread.start()
 
     def is_running(self):
         return self._loop_thread is not None and self._loop_thread.is_alive()
+
+    # ── 자세 등록 촬영 (설정창 포즈 탭) ────────────────────
+    def capture_pose_samples(self, on_status=None, countdown=3, duration=2.0):
+        """
+        자세를 취할 시간(countdown초)을 준 뒤 duration초 동안 포즈 특징을 모아서 돌려준다.
+        포즈 모드에서만 촬영할 수 있어서, 손 모드였다면 잠시 포즈 모드로 바꿨다가 촬영이 끝나면 되돌린다.
+        반환: (샘플 목록, None) 또는 (None, 오류 문구). 별도 스레드에서 호출해야 한다 (수 초 걸림).
+        """
+        def status(text):
+            if on_status:
+                on_status(text)
+
+        if not self.is_running() or self.pose is None:
+            return None, "비서가 아직 시작되지 않았습니다."
+        if self.is_paused():
+            return None, "일시정지 중에는 촬영할 수 없습니다. 재개한 뒤 다시 시도하세요."
+
+        previous_mode = self._shared["mode"]
+        switched = previous_mode != MODE_POSE
+        try:
+            if switched:
+                self._mode_queue.put(MODE_POSE)
+                deadline = time.time() + 3.0
+                while self._shared["mode"] != MODE_POSE and time.time() < deadline:
+                    time.sleep(0.05)
+                if self._shared["mode"] != MODE_POSE:
+                    return None, "포즈 모드로 전환하지 못했습니다."
+                time.sleep(0.5)   # 포즈 인식이 자리 잡을 시간
+
+            for remaining in range(countdown, 0, -1):
+                status(f"{remaining}초 뒤 촬영합니다. 자세를 취하세요.")
+                time.sleep(1.0)
+            status("촬영 중입니다. 자세를 그대로 유지하세요.")
+
+            samples, last_frame = [], -1
+            end = time.time() + duration
+            while time.time() < end:
+                res = self.pose.get_result()
+                features, frame_id = res["pose_features"], res["frame_id"]
+                if features is not None and frame_id != last_frame:   # 같은 프레임을 두 번 담지 않음
+                    samples.append([float(v) for v in features])
+                    last_frame = frame_id
+                time.sleep(0.01)
+            return samples, None
+        finally:
+            if switched:
+                self._mode_queue.put(previous_mode)
 
     # ── 창 닫기 확인 팝업의 버튼 응답 ──────────────────────
     def answer_close_confirm(self, yes):

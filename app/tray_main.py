@@ -56,6 +56,7 @@ try:
     import cameramodule
     import commandmodule
     import main as assistant_main
+    import posestore
     import settings as app_settings
     from popup import ClosePopup
     from settings_window import SettingsWindow
@@ -117,7 +118,7 @@ def notify(message, title="개인 AI 비서"):
         log(f"알림을 띄우지 못했습니다: {e}")
 
 
-def on_ui_event(name, **d):
+def on_ui_event(name, /, **d):
     """main.py가 넘기는 구조화 이벤트를 알림·팝업으로 바꾼다 (이벤트 목록은 main.py 참고)"""
     if name == "mode_changed":
         notify("손동작 모드" if d["mode"] == assistant_main.MODE_HAND else "전신 포즈 모드", "모드 전환")
@@ -129,6 +130,8 @@ def on_ui_event(name, **d):
         notify(f"화면을 저장했습니다\n{d['path']}", "화면 캡처")
     elif name == "capture_failed":
         notify(f"화면 캡처에 실패했습니다: {d['error']}", "화면 캡처")
+    elif name == "pose_recognized":
+        notify(f"자세 인식: {d['pose']}" + (" (명령 실행)" if d.get("executed") else " (연결된 명령 없음)"), "포즈")
     elif name == "voice_listening":
         notify("듣고 있습니다", "음성 명령")
     elif name == "voice_command_result":
@@ -166,6 +169,14 @@ def _set_voice(on):
     log(f"음성 명령 {'사용' if on else '사용 안 함'}")
 
 
+def _set_whisper(mode):
+    """음성 인식 실행 방식(auto/gpu/cpu) 저장. 모델은 시작할 때 한 번만 불러오므로 다음 실행부터 적용"""
+    app_cfg["whisper_mode"] = mode
+    if not app_settings.save(app_cfg):
+        log("설정을 저장하지 못했습니다 (settings.json)")
+    log(f"음성 인식 실행 방식 {mode} (다음 실행부터 적용)")
+
+
 def _on_registered(ok, name, result):
     if ok:
         action = result.get("action") if isinstance(result, dict) else result
@@ -175,8 +186,69 @@ def _on_registered(ok, name, result):
         notify(f"{name}: {result}", "명령을 저장하지 못했습니다")
 
 
+# ── 사용자 포즈 등록 (설정창 포즈 탭) ──────────────────────
+def _apply_poses():
+    """저장된 자세와 기본 제공 ㅡ자 설정을 인식기에 반영 (시작할 때, 등록·삭제·복원할 때)"""
+    data = posestore.load()
+    assistant.pose.set_templates(posestore.templates(data))
+    assistant.pose.set_tpose_enabled(data["builtin_tpose"])
+
+
+def _pose_list():
+    data = posestore.load()
+    commands = commandmodule.list_commands()
+    rows = []
+    if data["builtin_tpose"]:
+        rows.append({"name": posestore.BUILTIN_NAME, "kind": "기본 제공", "command": "화면 캡처 (내장)"})
+    for name in data["poses"]:
+        cmd = commands.get(f"pose_{name}")
+        action = cmd.get("action") if isinstance(cmd, dict) else None
+        target = cmd.get("target") if isinstance(cmd, dict) else None
+        rows.append({"name": name, "kind": "사용자",
+                     "command": (f"{action} · {target}" if target else f"{action}") if action else "(연결 안 됨)"})
+    return rows, {"builtin": data["builtin_tpose"], "count": posestore.count(data), "max": posestore.MAX_POSES}
+
+
+def _pose_capture(name, on_status):
+    data = posestore.load()
+    problem = posestore.validate_name(name, data)
+    if problem:
+        return False, problem
+    samples, error = assistant.capture_pose_samples(on_status)
+    if error:
+        return False, error
+    ok, message = posestore.add_pose(name, samples)
+    log(f"포즈 등록 {'성공' if ok else '실패'}: {name} - {message}")
+    if ok:
+        _apply_poses()
+        message += " 인식되면 알림이 뜹니다. 명령은 '명령 등록' 탭에서 연결하세요."
+    return ok, message
+
+
+def _pose_delete(name):
+    if name == posestore.BUILTIN_NAME:
+        posestore.set_builtin(False)
+        _apply_poses()
+        log("기본 제공 ㅡ자 자세 삭제")
+        return "기본 제공 ㅡ자 자세를 삭제했습니다. 같은 용도로 쓰려면 새 포즈를 등록하고 '화면 캡처해줘'를 연결하세요."
+    posestore.delete_pose(name)
+    had_command = commandmodule.delete_command(f"pose_{name}")
+    _apply_poses()
+    log(f"포즈 삭제: {name}")
+    return f"'{name}' 포즈를 삭제했습니다." + (" 연결된 명령도 함께 삭제했습니다." if had_command else "")
+
+
+def _pose_restore():
+    ok, message = posestore.set_builtin(True)
+    if ok:
+        _apply_poses()
+        log("기본 제공 ㅡ자 자세 복원")
+        return True, "기본 제공 ㅡ자(화면 캡처) 자세를 복원했습니다."
+    return False, message
+
+
 settings_window = SettingsWindow(
-    names=assistant_main.KNOWN_COMMAND_NAMES,
+    names=assistant_main.command_names,
     register_fn=assistant_main.register_named_command,
     list_fn=commandmodule.list_commands,
     delete_fn=commandmodule.delete_command,
@@ -185,6 +257,10 @@ settings_window = SettingsWindow(
     on_registered=_on_registered,
     get_dev=cameramodule.is_dev_overlay,
     set_dev=_set_dev,
+    get_whisper=lambda: app_cfg.get("whisper_mode", "auto"),
+    set_whisper=_set_whisper,
+    whisper_active=lambda: getattr(assistant.voice, "whisper_mode", None),
+    pose_api={"list": _pose_list, "capture": _pose_capture, "delete": _pose_delete, "restore": _pose_restore},
 )
 
 
@@ -291,6 +367,7 @@ def _boot(icon):
     try:
         assistant.start()
         assistant.set_voice_enabled(app_cfg.get("voice_enabled", True))  # 저장된 설정 반영
+        _apply_poses()                                                   # 등록해 둔 자세 반영
         state["phase"] = "running"
         log("비서 시작 완료" + ("" if app_cfg.get("voice_enabled", True) else " (음성 명령 사용 안 함)"))
     except Exception:

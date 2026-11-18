@@ -11,7 +11,8 @@ SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settin
 
 DEFAULTS = {
     "voice_enabled": True,   # 음성 명령(웨이크워드·손등 3초) 사용 여부
-    "dev_mode": False,       # 개발 모드: 카메라 미리보기에 점·선 외에 FPS·판정 수치 등 지표도 표시
+    "whisper_mode": "auto",  # 음성 인식 실행 방식: auto(GPU 있으면 medium, 없으면 small) / gpu / cpu. 바꾸면 다음 실행부터 적용
+    "dev_mode": False,      # 개발 모드: 카메라 미리보기에 점·선 외에 FPS·판정 수치 등 지표도 표시
 }
 
 

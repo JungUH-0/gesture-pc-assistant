@@ -20,6 +20,8 @@ import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 
+import settings as app_settings   # [추가] Whisper 실행 방식(whisper_mode)을 설정 파일에서 읽는다
+
 SAMPLE_RATE   = 16000
 BLOCK_SEC     = 0.1                              # 마이크 콜백 주기
 BLOCK_SAMPLES = int(SAMPLE_RATE * BLOCK_SEC)
@@ -28,7 +30,36 @@ CHUNK_SEC          = 3.0   # 웨이크워드 검사에 쓸 오디오 길이(최�
 CHECK_INTERVAL_SEC = 1.5   # 웨이크워드 검사 반복 주기
 
 WAKE_WORD  = "웨이크"  # [수정 예정] 아직 확정 아님 - 나중에 바뀔 수 있음
-MODEL_SIZE = "medium"
+# [변경] 모델 크기를 상수로 고정하던 방식은 쓰지 않는다. 아래 WHISPER_PROFILES와 설정창(음성 탭)의
+#        선택값으로 대체. GPU가 없는 PC에서도 시작할 수 있게 하려는 목적이다.
+# MODEL_SIZE = "medium"
+
+# [추가] Whisper 실행 방식. 설정(app/settings.json의 whisper_mode)이 고르는 값 하나로 세 항목이 함께 정해진다.
+#  - gpu : medium + CUDA + float16. 소음 환경에서 인식이 가장 안정적. NVIDIA GPU 필요
+#  - cpu : small + CPU + int8(양자화). GPU 없이 동작, 느리고 소음에 약함
+#  - auto: CUDA GPU가 잡히면 gpu, 아니면 cpu (기본값)
+WHISPER_PROFILES = {
+    "gpu": {"size": "medium", "device": "cuda", "compute_type": "float16"},
+    "cpu": {"size": "small",  "device": "cpu",  "compute_type": "int8"},
+}
+
+
+def has_cuda_gpu():
+    """CUDA GPU가 하나라도 잡히는지 확인 (faster-whisper가 쓰는 ctranslate2로 조회). 실패하면 없는 것으로 본다"""
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def resolve_whisper_profile(mode=None):
+    """설정값(auto/gpu/cpu)을 실제 (크기, 장치, 연산 방식)으로 바꾼다. 알 수 없는 값은 auto로 취급"""
+    if mode is None:
+        mode = app_settings.load().get("whisper_mode", "auto")
+    if mode not in WHISPER_PROFILES:
+        mode = "gpu" if has_cuda_gpu() else "cpu"
+    return mode, WHISPER_PROFILES[mode]
 
 BUFFER_SAMPLES = int(SAMPLE_RATE * CHUNK_SEC)
 
@@ -72,8 +103,13 @@ class VoiceModule:
         self._lock = threading.Lock()
         self.check_times = []  # 웨이크워드 검사 1회당 걸린 시간(초) - perf_check.py에서 읽음
 
-        print("[VoiceModule] Whisper 모델 로딩 중 (최초 1회, 시간이 좀 걸릴 수 있음)...")
-        self._model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+        mode, p = resolve_whisper_profile()
+        self.whisper_mode = mode   # 실제로 적용된 방식(gpu/cpu). 설정이 auto여도 여기엔 결과가 들어간다
+        print(f"[VoiceModule] Whisper 모델 로딩 중: {p['size']} / {p['device']} / {p['compute_type']} "
+              "(최초 1회, 시간이 좀 걸릴 수 있음)...")
+        # [변경] 기존: self._model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+        #        GPU가 없으면 이 줄에서 로드가 실패했다. 크기·장치·연산 방식을 설정에서 받도록 바꿈
+        self._model = WhisperModel(p["size"], device=p["device"], compute_type=p["compute_type"])
         print("[VoiceModule] 모델 로딩 완료")
 
     # ── 내부: 마이크 콜백 (블록 단위로 호출됨) ───────────────

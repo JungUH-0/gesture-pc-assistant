@@ -6,7 +6,9 @@
 
 import os
 import re
+import time
 from urllib.parse import quote_plus
+from PIL import ImageGrab  # [추가] 화면 캡처
 import win32gui
 import win32con
 import win32api  # [추가] 모니터 켜기용 마우스 이벤트
@@ -70,6 +72,32 @@ def _get_target_window():
     if win32gui.GetWindowText(hwnd) in _OWN_WINDOW_TITLES:
         return None
     return hwnd
+
+
+# [추가] 화면 캡처. 기본 제공 ㅡ자 자세와, 사용자가 등록한 자세에 연결한 "화면 캡처" 명령이 함께 쓴다.
+# 저장에 성공하면 listener(경로)를 호출해서 알림 등을 띄울 수 있게 한다 (main.py가 등록).
+_capture_listener = None
+
+
+def set_capture_listener(fn):
+    global _capture_listener
+    _capture_listener = fn
+
+
+def capture_screen(folder="captures"):
+    """전체 화면을 PNG로 저장. 반환 (성공 여부, 저장 경로 또는 오류 문구)"""
+    try:
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.abspath(os.path.join(folder, time.strftime("capture_%Y%m%d_%H%M%S.png")))
+        ImageGrab.grab().save(path)
+    except Exception as e:
+        return False, f"화면 캡처 실패: {e}"
+    if _capture_listener is not None:
+        try:
+            _capture_listener(path)
+        except Exception:
+            pass
+    return True, path
 
 
 # [추가] 창 닫기 확인용: 확인을 시작한 순간의 대상 창을 기억해 두었다가, "예"가 되면 그 창을 닫는다.

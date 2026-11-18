@@ -27,6 +27,7 @@ import mediapipe as mp
 # 한글 텍스트 표시 헬퍼는 cameramodule에 있는 것을 그대로 재사용 (cv.putText는 한글 불가).
 # cameramodule은 posemodule을 import하지 않으므로 순환 import가 생기지 않는다.
 from cameramodule import put_korean_text
+from posematcher import PoseMatcher
 
 mp_pose    = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
@@ -81,6 +82,7 @@ T_POSE_MAX_HEIGHT   = 0.4   # 손목·팔꿈치가 어깨 높이에서 벗어날
 T_POSE_HOLD_SEC     = 1.0   # 자세를 유지해야 하는 시간 (지나가다 걸리는 것 방지)
 T_POSE_COOLDOWN_SEC = 3.0   # 한 번 인정한 뒤 다시 인정하기까지의 최소 간격
 T_POSE_EVENT_HOLD_SEC = 0.3  # 결과값을 True로 유지하는 시간 (main의 0.02초 폴링이 놓치지 않게)
+POSE_EVENT_HOLD_SEC   = 0.3  # 사용자 등록 자세 이벤트도 같은 이유로 잠깐 유지
 
 # ── 고개 끄덕임(예) / 가로젓기(아니오) 판정 ─────────────────
 # 최근 HEAD_WINDOW_SEC 동안의 머리 값을 모아, 한 방향으로 움직였다가 되돌아오는 횟수
@@ -424,8 +426,17 @@ class PoseModule:
             "shake"          : False,  # 고개 가로젓기 (아니오)
             "away"           : False,  # 자리 비움 - 사람이 AWAY_AFTER_SEC 이상 안 보이는 동안 True
             "t_pose"         : False,  # 양팔 ㅡ자 유지 (화면 캡처용) - T_POSE_EVENT_HOLD_SEC 동안 True 유지
+            "pose_event"     : None,   # 사용자가 등록한 자세 이름 - 인식된 순간부터 POSE_EVENT_HOLD_SEC 동안 유지
+            "frame_id"       : 0,      # 처리한 프레임 번호 (등록 촬영 때 같은 프레임을 두 번 담지 않기 위함)
         }
         self._lock = threading.Lock()
+
+        # [추가] 사용자 등록 자세 (정지 자세) 비교. 등록은 설정창, 비교 로직은 posematcher.py
+        self.matcher = PoseMatcher()
+        self.tpose_enabled = True      # 기본 제공 ㅡ자(화면 캡처). 사용자가 삭제하면 False
+        self._frame_id = 0
+        self._pose_event_name  = None
+        self._pose_event_until = 0.0
 
         self._t_pose_since = None   # ㅡ자 자세가 시작된 시각
         self._t_pose_until = 0.0
@@ -487,9 +498,20 @@ class PoseModule:
             pass
 
     # ── 외부(cameramodule)에서 매 프레임 호출 ────────────────
+    # ── 등록 자세 설정 (설정창·트레이가 호출) ─────────────────
+    def set_templates(self, samples_by_name):
+        """등록한 자세들 {이름: 샘플 목록}을 바꿈. 빈 dict면 사용자 자세 인식을 끔."""
+        self.matcher.set_templates(samples_by_name)
+
+    def set_tpose_enabled(self, enabled):
+        """기본 제공 ㅡ자(화면 캡처) 켜기/끄기"""
+        self.tpose_enabled = bool(enabled)
+        self._t_pose_since = None
+
     def process(self, frame_rgb, frame_vis, landmark_canvas=None):
         # landmark_canvas: 랜드마크 점·선을 그릴 실제 화면. 없으면 frame_vis에 그림 (기존 동작).
         # 일반 모드에서는 frame_vis가 버려질 복사본이라, 점·선만 이쪽에 따로 그린다.
+        self._frame_id += 1
         res = self.pose.process(frame_rgb)
 
         detected       = False
@@ -520,7 +542,8 @@ class PoseModule:
             hands_together = get_hands_together(landmarks)
 
             # ㅡ자 자세를 T_POSE_HOLD_SEC 동안 유지하면 이벤트 (쿨다운 중이면 무시)
-            if get_t_pose(landmarks):
+            # (기본 제공 자세라 사용자가 삭제하면 판정하지 않는다)
+            if self.tpose_enabled and get_t_pose(landmarks):
                 if self._t_pose_since is None:
                     self._t_pose_since = now
                 held = now - self._t_pose_since
@@ -537,6 +560,18 @@ class PoseModule:
 
             features, reason = extract_pose_features(landmarks)
             detected = features is not None
+
+            # 사용자가 등록한 자세와 비교 (특징을 뽑지 못한 프레임은 None으로 넘겨 유지 끊김을 판단하게 함)
+            matched_name, match_info = self.matcher.update(now, features if detected else None)
+            if matched_name:
+                self._pose_event_name  = matched_name
+                self._pose_event_until = now + POSE_EVENT_HOLD_SEC
+                self._debug_note(f"EVENT pose {matched_name}")
+            if match_info:
+                cv.putText(frame_vis,
+                           f"POSE {match_info['name']} d={match_info['dist']:.2f}/{match_info['thr']:.2f}"
+                           f"{' *' if match_info['matched'] else ''}",
+                           (10, 270), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
 
             # 끄덕임 / 가로젓기: 팔(팔꿈치·손목)이 가려져 특징 추출이 실패한 프레임에서도
             # 판정한다. 필요한 것은 어깨(크기 기준)와 코·귀뿐이다.
@@ -560,10 +595,15 @@ class PoseModule:
                 box_color = (0, 255, 100) if detected else (0, 165, 255)
                 cv.rectangle(frame_vis, (x1, y1), (x2, y2), box_color, 2)
 
-                # 분류기가 붙기 전까지는 자세 이름 자리에 상태를 대신 표시
-                with self._lock:
-                    pose_name = self.result["pose_name"]
-                label = pose_name if pose_name else ("자세 학습 전" if detected else "인식 불가")
+                # 사용자 등록 자세에 가까우면 그 이름을, 아니면 상태를 표시
+                if match_info and match_info["matched"]:
+                    label = match_info["name"]
+                elif not detected:
+                    label = "인식 불가"
+                elif self.matcher.has_templates():
+                    label = "등록 자세 아님"
+                else:
+                    label = "등록된 자세 없음"
                 # 박스가 화면 위쪽에 붙어도 글자가 잘리지 않게 위치 보정
                 label_y = y1 - 10 if y1 > 30 else y2 + 28
                 put_korean_text(frame_vis, label, (x1, label_y - 20),
@@ -597,6 +637,7 @@ class PoseModule:
         else:
             self._head.clear()
             self._t_pose_since = None
+            self.matcher.update(now, None)   # 사람이 안 보이면 유지가 끊긴 것으로 처리
 
         if head_event == "nod":
             self._nod_until = now + HEAD_EVENT_HOLD_SEC
@@ -624,6 +665,8 @@ class PoseModule:
             self.result["shake"]          = now < self._shake_until
             self.result["away"]           = away
             self.result["t_pose"]         = now < self._t_pose_until
+            self.result["pose_event"]     = self._pose_event_name if now < self._pose_event_until else None
+            self.result["frame_id"]       = self._frame_id
 
     def get_result(self):
         """현재 감지 결과 반환 (스레드 안전)"""
@@ -641,7 +684,10 @@ class PoseModule:
             self.result["shake"]          = False
             self.result["away"]           = False
             self.result["t_pose"]         = False
+            self.result["pose_event"]     = None
         self._head.clear()
+        self.matcher.reset()
+        self._pose_event_name, self._pose_event_until = None, 0.0
         self._nod_until = self._shake_until = 0.0
         self._t_pose_since = None
         self._t_pose_until = 0.0
